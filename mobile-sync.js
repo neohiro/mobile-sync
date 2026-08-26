@@ -16,7 +16,7 @@
 
 import { execFile, spawn } from "node:child_process"
 import { readFile, writeFile, mkdir, rm, rename, readdir } from "node:fs/promises"
-import { readFileSync, existsSync } from "node:fs"
+import { readFileSync, writeFileSync, existsSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { homedir, platform, tmpdir } from "node:os"
 import { createConnection } from "node:net"
@@ -25,6 +25,21 @@ const MOBILE_SYNC_VERSION = "1.0.2"
 const GITHUB_REPO = "neohiro/mobile-sync"
 const UPDATE_CHECK_INTERVAL_MS = 3_600_000 // hourly
 const DEFAULT_PORT = 4096
+const GITHUB_API_BASE = "https://api.github.com"
+
+// ── ETag cache for GitHub release polling (avoids 60/hr rate limit) ─────────
+
+const CACHE_FILE = join(homedir(), ".opencode-sync-release-cache.json")
+function loadCache() {
+  try {
+    const raw = readFileSync(CACHE_FILE, "utf8").trim()
+    if (!raw) return {}
+    return JSON.parse(raw)
+  } catch { return {} }
+}
+function saveCache(cache) {
+  try { writeFileSync(CACHE_FILE, JSON.stringify(cache)) } catch {}
+}
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -152,17 +167,18 @@ function runPSCommand(command, opts = {}) {
 function isPortListening(port) {
   return new Promise((resolve) => {
     const socket = createConnection({ host: "127.0.0.1", port, family: 4 })
+    socket.setTimeout(2_000)
     let resolved = false
     const done = (result) => {
       if (resolved) return
       resolved = true
+      socket.removeAllListeners()
       socket.destroy()
       resolve(result)
     }
     socket.once("connect", () => done(true))
     socket.once("timeout", () => done(false))
     socket.once("error", () => done(false))
-    socket.setTimeout(2_000)
   })
 }
 
@@ -285,18 +301,32 @@ async function checkForUpdates(logFn, osNotify) {
   if (!pluginDir || !scriptsDir) return
 
   try {
+    const cache = loadCache()
+    const headers = {
+      "user-agent": `mobile-sync-plugin/${MOBILE_SYNC_VERSION}`,
+      accept: "application/vnd.github.v3+json",
+    }
+    if (cache.etag) headers["if-none-match"] = cache.etag
+
     const res = await fetch(
-      `https://api.github.com/repos/${GITHUB_REPO}/releases/latest?t=${Date.now()}`,
-      {
-        headers: {
-          "user-agent": `mobile-sync-plugin/${MOBILE_SYNC_VERSION}`,
-          accept: "application/vnd.github.v3+json",
-        },
-        signal: AbortSignal.timeout(15_000),
-      }
+      `${GITHUB_API_BASE}/repos/${GITHUB_REPO}/releases/latest`,
+      { headers, signal: AbortSignal.timeout(15_000) }
     )
-    if (!res.ok) return
+
+    if (res.status === 304) {
+      logFn("debug", "up to date (304 Not Modified)", { local: MOBILE_SYNC_VERSION })
+      return
+    }
+    if (!res.ok) {
+      logFn("debug", `GitHub API returned ${res.status}`, { status: res.status })
+      return
+    }
+
     const release = await res.json()
+    const newEtag = res.headers.get("etag")
+    if (newEtag) {
+      saveCache({ etag: newEtag, version: MOBILE_SYNC_VERSION })
+    }
     const remoteVersion = (release.tag_name || "").replace(/^v/, "")
     if (!remoteVersion || !isNewer(remoteVersion, MOBILE_SYNC_VERSION)) {
       logFn("debug", "up to date", { local: MOBILE_SYNC_VERSION, remote: remoteVersion })
@@ -305,7 +335,6 @@ async function checkForUpdates(logFn, osNotify) {
 
     logFn("info", `update available: ${MOBILE_SYNC_VERSION} -> ${remoteVersion}`)
 
-    // Download the zipball
     const zipball = release.zipball_url
     if (!zipball) return
 
@@ -319,8 +348,6 @@ async function checkForUpdates(logFn, osNotify) {
     if (!zipRes.ok) return
     const zipBytes = Buffer.from(await zipRes.arrayBuffer())
 
-    // Write zip to temp, extract, replace. Use try/finally for temp cleanup
-    // so partial failures don't leak files in tmpdir.
     const tempDir = join(tmpdir(), `mobile-sync-update-${Date.now()}`)
     await mkdir(tempDir, { recursive: true })
     try {
@@ -329,18 +356,15 @@ async function checkForUpdates(logFn, osNotify) {
 
       if (isWindows) {
         const extractDir = join(tempDir, "extracted")
-        // Use runPSCommand for inline -Command (not runPS which uses -File)
         await runPSCommand(
           `Expand-Archive -Path '${zipPath}' -DestinationPath '${extractDir}' -Force`,
           { timeout: 30_000 }
         )
 
-        // Find the extracted folder (GitHub zip contains a single folder)
         const entries = await readdir(extractDir)
         if (entries.length === 0) return
         const srcDir = join(extractDir, entries[0])
 
-        // Copy scripts/ if present
         const scriptsSrc = join(srcDir, "scripts")
         if (existsSync(scriptsSrc)) {
           const scriptsDest = scriptsDir
@@ -348,7 +372,6 @@ async function checkForUpdates(logFn, osNotify) {
           await copyDir(scriptsSrc, scriptsDest)
         }
 
-        // Copy updated plugin file (with rollback on failure)
         const pluginSrc = join(srcDir, "mobile-sync.js")
         if (existsSync(pluginSrc)) {
           const pluginDest = join(pluginDir, "mobile-sync.js")
@@ -357,13 +380,11 @@ async function checkForUpdates(logFn, osNotify) {
           try {
             await copyFile(pluginSrc, pluginDest)
           } catch (copyErr) {
-            // Rollback: restore .bak as current so plugin isn't bricked
             await rename(backup, pluginDest).catch(() => {})
             throw copyErr
           }
         }
 
-        // Copy package.json if present
         const pkgSrc = join(srcDir, "package.json")
         if (existsSync(pkgSrc)) {
           await copyFile(pkgSrc, join(pluginDir, "package.json"))
@@ -373,7 +394,6 @@ async function checkForUpdates(logFn, osNotify) {
         osNotify("mobile-sync Updated", `Updated to v${remoteVersion}. Restart OpenCode to apply.`)
       }
     } finally {
-      // Cleanup temp (always, even on failure)
       await rm(tempDir, { recursive: true, force: true }).catch(() => {})
     }
   } catch (err) {
@@ -417,8 +437,9 @@ const MobileSyncPlugin = async ({ client, $ }) => {
   let launcherPid = null   // PID of the PowerShell wrapper that launched the sidecar
   let updateTimer = null
   let lastUpdateCheckAt = 0
-  let lastRelaunchAt = 0    // cooldown for event-driven relaunch
-  const RELAUNCH_COOLDOWN_MS = 60_000  // don't relaunch more than once per minute
+  let lastRelaunchAt = 0    // wall-clock of last relaunch attempt
+  let portWasDown = false   // true while port is known to be down (cooldown gates on this)
+  const RELAUNCH_COOLDOWN_MS = 60_000  // don't relaunch more than once per minute while port is down
   let relaunching = false  // debounce guard for concurrent event-driven relaunch
   const osNotify = createOsNotifier({ $ })
 
@@ -484,8 +505,13 @@ const MobileSyncPlugin = async ({ client, $ }) => {
 
   // ── Hooks (returned immediately, never blocks) ──
   return {
-    // Set environment variables for all shell commands.
-    // Only set if not already present (respect user overrides).
+    // Inject OPENCODE_PORT + OPENCODE_SERVER_PASSWORD into shell command env.
+    // SECURITY: the password is injected as plain text into every shell command's
+    // env so users can curl/wget the server without re-typing the password. The
+    // auth scheme is Basic — these env vars are equivalent to bearer tokens.
+    // Mitigations: only set if not already present in output.env (respect
+    // explicit user overrides), and the password is read from a per-user file
+    // that the user already controls (chmod 600 on POSIX).
     "shell.env": async (_input, output) => {
       if (!output.env.OPENCODE_PORT) {
         output.env.OPENCODE_PORT = String(port)
@@ -496,7 +522,8 @@ const MobileSyncPlugin = async ({ client, $ }) => {
     },
 
     // Periodic health check on session idle.
-    // Throttled to 1 check/minute to avoid flapping during normal startup.
+    // Cooldown: if port is down, attempt relaunch at most once per minute.
+    // When port comes back up, cooldown resets so we react quickly next time it drops.
     event: async (input) => {
       try {
         const event = input && typeof input === "object" ? input.event : null
@@ -504,15 +531,24 @@ const MobileSyncPlugin = async ({ client, $ }) => {
 
         if (event.type === "session.idle") {
           if (!isWindows || relaunching) return
-          if (Date.now() - lastRelaunchAt < RELAUNCH_COOLDOWN_MS) return
           const portOpen = await isPortListening(port)
-          if (!portOpen) {
-            relaunching = true
+          if (portOpen) {
+            // Port is back — clear the down flag so the next outage triggers fast recovery
+            portWasDown = false
+            return
+          }
+          if (!portWasDown || (Date.now() - lastRelaunchAt) >= RELAUNCH_COOLDOWN_MS) {
+            portWasDown = true
             lastRelaunchAt = Date.now()
+            relaunching = true
             logFn("warn", "sidecar not responding, re-launching...")
             try {
               const result = await ensureSidecarRunning(logFn)
               if (result.pid) launcherPid = result.pid
+              if (await isPortListening(port)) {
+                portWasDown = false
+                logFn("info", "sidecar recovered")
+              }
             } finally {
               relaunching = false
             }
@@ -548,11 +584,9 @@ const MobileSyncPlugin = async ({ client, $ }) => {
   }
 }
 
-export const MobileSyncPluginExport = {
+export default {
   id: "mobile-sync",
   server: MobileSyncPlugin
 }
-
-export default MobileSyncPluginExport
 
 

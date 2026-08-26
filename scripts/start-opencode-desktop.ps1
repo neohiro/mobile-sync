@@ -18,10 +18,10 @@ $passwordFile = "$env:USERPROFILE\.opencode-server-password"
 $defaultPassword = 'NJYA0Uw1A7kePY8fv4BCftNH'
 
 # --- Load password from file (matches start-opencode-server.ps1 behavior) ---
+$password = $null
 if (Test-Path -LiteralPath $passwordFile) {
     $password = (Get-Content -LiteralPath $passwordFile -Raw).Trim()
-} else {
-    $password = $defaultPassword
+    if (-not $password) { $password = $null }
 }
 if (-not $password) { $password = $defaultPassword }
 

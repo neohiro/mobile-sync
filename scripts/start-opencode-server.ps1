@@ -58,8 +58,8 @@ if ($existing) {
 
 # --- Guard: password file ---
 $defaultPassword = 'NJYA0Uw1A7kePY8fv4BCftNH'
-if ($Password) {
-    # Use the explicitly provided password; persist it for next time
+if ($PSBoundParameters.ContainsKey('Password')) {
+    if (-not $Password) { throw "-Password cannot be empty. Pass a non-empty value or omit the parameter." }
     [System.IO.File]::WriteAllText($passwordFile, $Password)
 } elseif (-not (Test-Path -LiteralPath $passwordFile)) {
     Write-Host "Creating password file with default password: $passwordFile" -ForegroundColor Cyan

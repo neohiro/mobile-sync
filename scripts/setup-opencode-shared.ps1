@@ -175,7 +175,8 @@ if ($Rotate) {
 }
 
 $defaultPassword = 'NJYA0Uw1A7kePY8fv4BCftNH'
-if ($Password) {
+if ($PSBoundParameters.ContainsKey('Password')) {
+    if (-not $Password) { throw "-Password cannot be empty. Pass a non-empty value or omit the parameter." }
     Invoke-Step "Write password from parameter" -Action {
         [System.IO.File]::WriteAllText($passwordFile, $Password)
         Write-Host "  Password set from parameter." -ForegroundColor Green

@@ -196,7 +196,7 @@ if ($hostname) {
     if (Test-Path -LiteralPath $deviceRegistry) {
         try {
             $devices = @(Get-Content -LiteralPath $deviceRegistry -Raw | ConvertFrom-Json | Where-Object { $_.Hostname })
-            $registered = ($devices | Where-Object { $_.Hostname -eq $hostname }) -ne $null
+            $registered = [bool]($devices | Where-Object { $_.Hostname -eq $hostname })
         } catch { }
     }
 
