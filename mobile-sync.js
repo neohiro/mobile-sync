@@ -19,6 +19,7 @@ import { readFile, writeFile, mkdir, rm, rename, readdir } from "node:fs/promise
 import { readFileSync, existsSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { homedir, platform, tmpdir } from "node:os"
+import { createConnection } from "node:net"
 
 const MOBILE_SYNC_VERSION = "1.0.2"
 const GITHUB_REPO = "neohiro/mobile-sync"
@@ -147,16 +148,21 @@ function runPSCommand(command, opts = {}) {
   })
 }
 
-/** Check if a TCP port is listening. */
+/** Check if a TCP port is listening on localhost. Pure Node — no PowerShell overhead. */
 function isPortListening(port) {
   return new Promise((resolve) => {
-    execFile(PS_EXE, [
-      ...PS_FLAGS,
-      "-Command",
-      `Test-NetConnection -ComputerName 127.0.0.1 -Port ${port} -InformationLevel Quiet`
-    ], { windowsHide: true, timeout: 10_000 }, (err, stdout) => {
-      resolve(stdout?.trim() === "True")
-    })
+    const socket = createConnection({ host: "127.0.0.1", port, family: 4 })
+    let resolved = false
+    const done = (result) => {
+      if (resolved) return
+      resolved = true
+      socket.destroy()
+      resolve(result)
+    }
+    socket.once("connect", () => done(true))
+    socket.once("timeout", () => done(false))
+    socket.once("error", () => done(false))
+    socket.setTimeout(2_000)
   })
 }
 
@@ -411,7 +417,9 @@ const MobileSyncPlugin = async ({ client, $ }) => {
   let launcherPid = null   // PID of the PowerShell wrapper that launched the sidecar
   let updateTimer = null
   let lastUpdateCheckAt = 0
-  let relaunching = false // debounce guard for event-driven relaunch
+  let lastRelaunchAt = 0    // cooldown for event-driven relaunch
+  const RELAUNCH_COOLDOWN_MS = 60_000  // don't relaunch more than once per minute
+  let relaunching = false  // debounce guard for concurrent event-driven relaunch
   const osNotify = createOsNotifier({ $ })
 
   const TAG = "[mobile-sync]"
@@ -487,7 +495,8 @@ const MobileSyncPlugin = async ({ client, $ }) => {
       }
     },
 
-    // Periodic health check on session idle
+    // Periodic health check on session idle.
+    // Throttled to 1 check/minute to avoid flapping during normal startup.
     event: async (input) => {
       try {
         const event = input && typeof input === "object" ? input.event : null
@@ -495,9 +504,11 @@ const MobileSyncPlugin = async ({ client, $ }) => {
 
         if (event.type === "session.idle") {
           if (!isWindows || relaunching) return
+          if (Date.now() - lastRelaunchAt < RELAUNCH_COOLDOWN_MS) return
           const portOpen = await isPortListening(port)
           if (!portOpen) {
             relaunching = true
+            lastRelaunchAt = Date.now()
             logFn("warn", "sidecar not responding, re-launching...")
             try {
               const result = await ensureSidecarRunning(logFn)

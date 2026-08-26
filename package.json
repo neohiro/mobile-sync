@@ -1,6 +1,6 @@
 {
   "name": "mobile-sync",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "description": "OpenCode plugin: makes the desktop sidecar a shared server for mobile sync via Tailscale Funnel",
   "main": "mobile-sync.js",
