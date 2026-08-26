@@ -16,8 +16,8 @@
 
 import { execFile, spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
-import { readFile, writeFile, mkdir, rm, rename, readdir } from "node:fs/promises"
-import { readFileSync, writeFileSync, existsSync } from "node:fs"
+import { readFile, writeFile, mkdir, rm, readdir, rename } from "node:fs/promises"
+import { readFileSync, writeFileSync, existsSync, renameSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { homedir, platform, tmpdir } from "node:os"
 import { createConnection } from "node:net"
@@ -29,29 +29,35 @@ const DEFAULT_PORT = 4096
 const GITHUB_API_BASE = "https://api.github.com"
 
 // ── ETag cache for GitHub release polling (avoids 60/hr rate limit) ─────────
-
+// Writes are serialized via a module-scope promise chain so concurrent
+// checkForUpdates() calls (e.g. one-shot init + hourly interval) can't
+// interleave JSON on Windows (which lacks atomic append).
 const CACHE_FILE = join(homedir(), ".opencode-sync-release-cache.json")
+let _cacheWriteChain = Promise.resolve()
 function loadCache() {
   try {
     const raw = readFileSync(CACHE_FILE, "utf8").trim()
     if (!raw) return {}
     const parsed = JSON.parse(raw)
-    // Self-heal: if the file is structurally invalid (not an object), delete it
-    // so the next saveCache() creates a fresh one. Otherwise we'd be stuck with
-    // a broken cache forever (saveCache only runs on successful API responses).
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
       try { writeFileSync(CACHE_FILE, "{}") } catch {}
       return {}
     }
     return parsed
-  } catch (err) {
-    // Corrupt JSON — delete so we can recover on next successful fetch.
+  } catch {
     try { writeFileSync(CACHE_FILE, "{}") } catch {}
     return {}
   }
 }
 function saveCache(cache) {
-  try { writeFileSync(CACHE_FILE, JSON.stringify(cache)) } catch {}
+  // Serialize writes so two concurrent updaters can't interleave JSON bytes.
+  const next = _cacheWriteChain.then(() => {
+    try { writeFileSync(CACHE_FILE, JSON.stringify(cache)) } catch {}
+  })
+  // Swallow rejections on the chain itself so one bad write doesn't poison
+  // subsequent saves. The .then handler already catches its own write errors.
+  _cacheWriteChain = next.catch(() => {})
+  return next
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -71,7 +77,12 @@ const FUNNEL_URL_FILE = join(homedir(), ".opencode-funnel-url")
 const generatePassword = () => randomBytes(18).toString("base64url")
 
 /** Normalize any thrown value into a string for logging. Handles Error objects, strings, numbers, objects, nullish. */
-const errStr = (err) => err?.message ?? (typeof err === "string" ? err : JSON.stringify(err))
+const errStr = (err) => {
+  if (err == null) return String(err) // catches null and undefined -> "null"/"undefined"
+  if (typeof err === "string") return err
+  if (err.message) return err.message
+  try { return JSON.stringify(err) } catch { return Object.prototype.toString.call(err) }
+}
 
 // ── OS notifications (same mechanism as auto-resume) ────────────────────────
 
@@ -153,28 +164,28 @@ const scriptsDir = pluginDir ? join(pluginDir, "mobile-sync-scripts") : null
  * in the startup log so they can configure their mobile app.
  * Empty, BOM-only, or corrupted files are regenerated (self-healing).
  * NEVER falls back to a hardcoded value — every install gets a unique secret.
+ *
+ * Thread-safety: writes use a temp file + atomic rename so concurrent calls
+ * from multiple processes produce a consistent file (last writer wins, but
+ * no partial-file corruption). File mode 0o600 — world-inaccessible on POSIX;
+ * Windows enforces per-user ACLs regardless.
  */
 function readPassword() {
   let needsWrite = false
   let raw = ""
   try {
-    // Strip UTF-8 BOM (\uFEFF) which some Windows editors add.
     raw = readFileSync(PASSWORD_FILE, "utf8").replace(/^\uFEFF/, "").trim()
-  } catch (err) {
-    // File missing — first run.
+  } catch {
     needsWrite = true
   }
-  if (!needsWrite && raw.length === 0) {
-    // File exists but is empty — treat as corrupted and regenerate.
-    needsWrite = true
-  }
+  if (!needsWrite && raw.length === 0) needsWrite = true
   if (needsWrite) {
     const generated = generatePassword()
+    const tmpPath = PASSWORD_FILE + ".tmp"
     try {
-      writeFileSync(PASSWORD_FILE, generated + "\n", { mode: 0o600 })
+      writeFileSync(tmpPath, generated + "\n", { mode: 0o600 })
+      renameSync(tmpPath, PASSWORD_FILE) // atomic on same filesystem
     } catch (err) {
-      // If we can't write (permissions, read-only fs), return the generated
-      // value for this session only. It won't persist across restarts.
       logFnOnce("warn", "could not persist generated password; using ephemeral one", { error: errStr(err) })
       return generated
     }
@@ -399,7 +410,7 @@ async function checkForUpdates(logFn, osNotify) {
     const release = await res.json()
     const newEtag = res.headers.get("etag")
     if (newEtag) {
-      saveCache({ etag: newEtag, version: MOBILE_SYNC_VERSION })
+      await saveCache({ etag: newEtag, version: MOBILE_SYNC_VERSION })
     }
     const remoteVersion = (release.tag_name || "").replace(/^v/, "")
     if (!remoteVersion || !isNewer(remoteVersion, MOBILE_SYNC_VERSION)) {
@@ -445,7 +456,16 @@ async function checkForUpdates(logFn, osNotify) {
         const scriptsSrc = join(srcDir, "scripts")
         if (existsSync(scriptsSrc)) {
           const scriptsDest = scriptsDir
-          await rm(scriptsDest, { recursive: true, force: true })
+          // Try to remove the existing scripts directory first. This can fail on
+          // Windows if a running PowerShell process (e.g. the CLI server) has one
+          // of the scripts open with an exclusive lock. In that case we fall back
+          // to a per-file copy (files that were removed in the new release will
+          // persist as orphans — acceptable; new/updated files are still deployed).
+          try {
+            await rm(scriptsDest, { recursive: true, force: true })
+          } catch (rmErr) {
+            logFn("debug", "could not remove scripts dir (locked), doing per-file copy", { error: errStr(rmErr) })
+          }
           await copyDir(scriptsSrc, scriptsDest)
         }
 

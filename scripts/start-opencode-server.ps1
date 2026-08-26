@@ -95,21 +95,31 @@ if ($existing) {
     exit 0
 }
 
-# --- Find opencode.exe ---
-$exe = @(
-    "$env:LOCALAPPDATA\Microsoft\WinGet\Links\opencode.exe"
-    (Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\SST.opencode_*\opencode.exe" -ErrorAction SilentlyContinue |
-        Select-Object -First 1 -ExpandProperty FullName)
-) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+# --- Find opencode.exe (PATH first, then common install locations) ---
+$exe = $null
+$cmd = Get-Command opencode -ErrorAction SilentlyContinue
+if ($cmd) { $exe = $cmd.Path }
+if (-not $exe) {
+    $exe = @(
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Links\opencode.exe"
+        (Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\SST.opencode_*\opencode.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName)
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+}
 
 if (-not $exe) { throw "opencode.exe not found. Install via: winget install SST.opencode" }
 
 # --- IMPORTANT: env vars are process-scoped only ---
 # NEVER set OPENCODE_* globally in the registry - it bricks the desktop client.
+# We also clear it in `finally` so the parent PowerShell session doesn't leak
+# the password to other commands after this script exits.
 $env:OPENCODE_SERVER_PASSWORD = $password
 
 # Launch the server from the user's home directory so ALL project directories
 # are visible. The mobile app's "Directory" field filters to one project.
+if (-not (Test-Path -LiteralPath $homeDir)) {
+    throw "Home directory not found: $homeDir"
+}
 Push-Location -LiteralPath $homeDir
 try {
 
@@ -158,4 +168,9 @@ if ($Detached) {
         & $exe serve --hostname $bindHost --port $port
     }
 }
-} finally { Pop-Location }
+} finally {
+    Pop-Location
+    # Clear the password from the parent process's environment so it doesn't
+    # leak to other commands run from the same PowerShell session.
+    Remove-Item Env:\OPENCODE_SERVER_PASSWORD -ErrorAction SilentlyContinue
+}

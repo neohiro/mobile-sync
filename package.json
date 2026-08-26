@@ -1,22 +1,13 @@
 {
   "name": "mobile-sync",
   "version": "1.0.2",
+  "description": "OpenCode plugin for mobile sync via Tailscale Funnel",
   "type": "module",
-  "description": "OpenCode plugin: makes the desktop sidecar a shared server for mobile sync via Tailscale Funnel",
-  "main": "mobile-sync.js",
-  "keywords": ["opencode", "opencode-plugin", "mobile", "sync", "tailscale"],
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/neohiro/mobile-sync"
+  "scripts": {
+    "build": "bun build mobile-sync.js --target=node --no-bundle --outdir .",
+    "test": "bun test"
   },
-  "engines": {
-    "opencode": ">=1.18.0"
-  },
-  "files": [
-    "mobile-sync.js",
-    "scripts/**/*.ps1",
-    "README.md",
-    "LICENSE"
-  ]
+  "devDependencies": {
+    "bun-types": "latest"
+  }
 }

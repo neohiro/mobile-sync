@@ -104,12 +104,17 @@ $passwordFile = "$env:USERPROFILE\.opencode-server-password"
 # --- Step 1: Verify prerequisites ---
 Write-Host "[1/6] Checking prerequisites..." -ForegroundColor Yellow
 
-# OpenCode CLI
-$exe = @(
-    "$env:LOCALAPPDATA\Microsoft\WinGet\Links\opencode.exe"
-    (Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\SST.opencode_*\opencode.exe" -ErrorAction SilentlyContinue |
-        Select-Object -First 1 -ExpandProperty FullName)
-) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+# OpenCode CLI (PATH first, then known install locations)
+$exe = $null
+$cmd = Get-Command opencode -ErrorAction SilentlyContinue
+if ($cmd) { $exe = $cmd.Path }
+if (-not $exe) {
+    $exe = @(
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Links\opencode.exe"
+        (Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\SST.opencode_*\opencode.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName)
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+}
 
 if (-not $exe) {
     Invoke-Step "Install OpenCode CLI" -Action {

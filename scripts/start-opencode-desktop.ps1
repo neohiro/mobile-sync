@@ -81,7 +81,8 @@ if ($existing) {
 }
 
 # --- Set env vars for the desktop process ---
-# These are inherited by the sidecar via utilityProcess.fork()
+# These are inherited by the sidecar via utilityProcess.fork().
+# We clear them in a finally block so they don't persist in the parent shell.
 $env:OPENCODE_PORT = $port
 $env:OPENCODE_SERVER_PASSWORD = $password
 
@@ -94,6 +95,7 @@ Write-Host "  Password:      $masked" -ForegroundColor Gray
 Write-Host "  DB:            ~/.local/share/opencode/opencode.db" -ForegroundColor Gray
 Write-Host ""
 
+try {
 if ($Detached) {
     Start-Process -FilePath $desktop -WindowStyle Normal
     Write-Host "Desktop launched. Waiting for sidecar on port $port..." -ForegroundColor Green
@@ -112,4 +114,8 @@ if ($Detached) {
     }
 } else {
     & $desktop
+}
+} finally {
+    Remove-Item Env:\OPENCODE_PORT -ErrorAction SilentlyContinue
+    Remove-Item Env:\OPENCODE_SERVER_PASSWORD -ErrorAction SilentlyContinue
 }
