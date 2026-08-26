@@ -63,6 +63,9 @@ const PS_FLAGS = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive"]
 const PASSWORD_FILE = join(homedir(), ".opencode-server-password")
 const DEFAULT_PASSWORD = "NJYA0Uw1A7kePY8fv4BCftNH"
 
+/** Normalize any thrown value into a string for logging. Handles Error objects, strings, numbers, objects, nullish. */
+const errStr = (err) => err?.message ?? (typeof err === "string" ? err : JSON.stringify(err))
+
 // ── OS notifications (same mechanism as auto-resume) ────────────────────────
 
 const psQuote = (s) => "'" + String(s).replace(/'/g, "''") + "'"
@@ -234,7 +237,7 @@ async function runFirstTimeSetup(logFn) {
     await runPS(setupScript, ["-Quick", "-Patch"], { timeout: 120_000 })
     logFn("info", "first-time setup complete")
   } catch (err) {
-    logFn("error", "first-time setup failed", { error: err?.message ?? err })
+    logFn("error", "first-time setup failed", { error: errStr(err) })
   }
 }
 
@@ -283,7 +286,7 @@ async function ensureSidecarRunning(logFn) {
     logFn("warn", `CLI server not listening after 15s on port ${DEFAULT_PORT}`)
     return { launched: false, pid: child.pid }
   } catch (err) {
-    logFn("error", "failed to launch CLI server", { error: err?.message ?? err })
+    logFn("error", "failed to launch CLI server", { error: errStr(err) })
     return { launched: false, pid: null }
   }
 }
@@ -310,7 +313,7 @@ function startWatcher(logFn) {
     logFn("info", `watcher started (PID ${child.pid})`)
     return child
   } catch (err) {
-    logFn("error", "failed to start watcher", { error: err?.message ?? err })
+    logFn("error", "failed to start watcher", { error: errStr(err) })
     return null
   }
 }
@@ -410,7 +413,7 @@ async function checkForUpdates(logFn, osNotify) {
             // File may be locked (still loaded by host). Log and abort update —
             // overwriting without a backup would brick the plugin permanently.
             logFn("warn", "could not back up plugin file, skipping update", {
-              error: renameErr?.message ?? renameErr,
+              error: errStr(renameErr),
               hint: "plugin may be loaded by host; restart and retry",
             })
             return
@@ -431,13 +434,13 @@ async function checkForUpdates(logFn, osNotify) {
         logFn("info", `self-updated to ${remoteVersion}. Restart OpenCode to load.`)
         // .catch guards against unhandled rejection in the fire-and-forget toast.
         osNotify("mobile-sync Updated", `Updated to v${remoteVersion}. Restart OpenCode to apply.`)
-          .catch((err) => logFn("debug", "update toast failed", { error: err?.message ?? err }))
+          .catch((err) => logFn("debug", "update toast failed", { error: errStr(err) }))
       }
     } finally {
       await rm(tempDir, { recursive: true, force: true }).catch(() => {})
     }
   } catch (err) {
-    logFn("debug", "update check skipped", { error: err?.message ?? err })
+    logFn("debug", "update check skipped", { error: errStr(err) })
   }
 }
 
@@ -485,8 +488,6 @@ const MobileSyncPlugin = async ({ $ }) => {
   const osNotify = createOsNotifier({ $ })
 
   const TAG = "[mobile-sync]"
-  /** Normalize any thrown value into a string for logging. Handles Error objects, strings, and unknowns. */
-  const errStr = (err) => err?.message ?? (typeof err === "string" ? err : JSON.stringify(err))
   const logFn = (level, msg, extra) => {
     const line = `${TAG} ${msg}`
     const fn = level === "error" ? "error"
