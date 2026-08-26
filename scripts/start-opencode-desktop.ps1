@@ -15,15 +15,28 @@ $ErrorActionPreference = 'Stop'
 
 $port = 4096
 $passwordFile = "$env:USERPROFILE\.opencode-server-password"
-$defaultPassword = 'NJYA0Uw1A7kePY8fv4BCftNH'
+$directoryFile = "$env:USERPROFILE\.opencode-server-directory"
 
-# --- Load password from file (matches start-opencode-server.ps1 behavior) ---
+# --- Load password from file. If missing, exit — the plugin generates it
+# on its first run, or setup-opencode-shared.ps1 does the same. We never
+# fall back to a hardcoded value: every install gets its own unique secret.
 $password = $null
 if (Test-Path -LiteralPath $passwordFile) {
     $password = (Get-Content -LiteralPath $passwordFile -Raw).Trim()
     if (-not $password) { $password = $null }
 }
-if (-not $password) { $password = $defaultPassword }
+if (-not $password) {
+    Write-Host "Password file not found: $passwordFile" -ForegroundColor Red
+    Write-Host "  Run setup-opencode-shared.ps1 first, or load the plugin once to generate one." -ForegroundColor Yellow
+    exit 1
+}
+
+# --- Save home directory so the mobile app can find the server's working dir ---
+# Desktop launches from the user's current location, but the server still
+# references the saved directory file for the mobile app to read.
+if (-not (Test-Path -LiteralPath $directoryFile)) {
+    [System.IO.File]::WriteAllText($directoryFile, $env:USERPROFILE)
+}
 
 # --- Discover desktop executable ---
 function Find-DesktopExe {

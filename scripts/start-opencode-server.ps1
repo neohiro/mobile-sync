@@ -3,6 +3,9 @@
 # The patched desktop sidecar (start-opencode-desktop.ps1) is the primary server.
 # Both share the same session database at ~/.local/share/opencode/opencode.db
 #
+# The server is started from $HOME so that ALL project directories are visible
+# to the mobile app (use the Directory field in the app to filter to one project).
+#
 # Usage:
 #   .\start-opencode-server.ps1                          # Start server (foreground)
 #   .\start-opencode-server.ps1 -Detached                # Start server in background
@@ -20,11 +23,39 @@ $bindHost = '127.0.0.1'
 $passwordFile = "$env:USERPROFILE\.opencode-server-password"
 $directoryFile = "$env:USERPROFILE\.opencode-server-directory"
 
-# --- Save the directory this server is being started from ---
-# The CLI server has no --directory flag, so the mobile app needs to know
-# the working directory to filter sessions to the right project.
-$currentDir = (Get-Location).Path
-[System.IO.File]::WriteAllText($directoryFile, $currentDir)
+# --- Generate password on first run (no hardcoded value) ---
+# SECURITY: A cryptographically random password is generated only when the
+# password file is missing. The user sees it once at startup so they can
+# configure the mobile app. On subsequent runs the same password is reused.
+function New-SecurePassword {
+    param([int]$Length = 24)
+    $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $bytes = New-Object byte[] $Length
+    $rng.GetBytes($bytes)
+    $result = -join ($bytes | ForEach-Object { $chars[$_ % $chars.Length] })
+    $rng.Dispose()
+    return $result
+}
+
+# --- Guard: password file ---
+if ($PSBoundParameters.ContainsKey('Password')) {
+    if (-not $Password) { throw "-Password cannot be empty. Pass a non-empty value or omit the parameter." }
+    [System.IO.File]::WriteAllText($passwordFile, $Password)
+} elseif (-not (Test-Path -LiteralPath $passwordFile)) {
+    $generated = New-SecurePassword
+    [System.IO.File]::WriteAllText($passwordFile, $generated)
+    Write-Host "Generated new random password (saved to $passwordFile)" -ForegroundColor Cyan
+}
+$password = (Get-Content -LiteralPath $passwordFile -Raw).Trim()
+if (-not $password) { throw "Password file is empty: $passwordFile" }
+
+# --- Save home directory so the mobile app can find the server's working dir ---
+# The CLI server has no --directory flag, so it serves ALL projects it can find
+# in its working directory. We launch from $HOME so every project the user has
+# is visible. The mobile app can use the Directory field to filter.
+[System.IO.File]::WriteAllText($directoryFile, $env:USERPROFILE)
+$homeDir = $env:USERPROFILE
 
 # --- Load saved funnel URL or detect from Tailscale ---
 $funnelConfigFile = "$env:USERPROFILE\.opencode-funnel-url"
@@ -33,9 +64,10 @@ if (Test-Path -LiteralPath $funnelConfigFile) {
     $funnelUrl = (Get-Content -LiteralPath $funnelConfigFile -Raw).Trim()
 }
 if (-not $funnelUrl) {
-    $tsPath = "C:\Program Files\Tailscale\tailscale.exe"
-    if (Test-Path $tsPath) {
-        $tsJson = & $tsPath status --json 2>&1
+    $ts = Get-Command tailscale -ErrorAction SilentlyContinue
+    if (-not $ts) { $ts = Get-Command "C:\Program Files\Tailscale\tailscale.exe" -ErrorAction SilentlyContinue }
+    if ($ts) {
+        $tsJson = & $ts.Path status --json 2>&1
         if ($LASTEXITCODE -eq 0) {
             try {
                 $tsSelf = ($tsJson | ConvertFrom-Json).Self
@@ -63,18 +95,6 @@ if ($existing) {
     exit 0
 }
 
-# --- Guard: password file ---
-$defaultPassword = 'NJYA0Uw1A7kePY8fv4BCftNH'
-if ($PSBoundParameters.ContainsKey('Password')) {
-    if (-not $Password) { throw "-Password cannot be empty. Pass a non-empty value or omit the parameter." }
-    [System.IO.File]::WriteAllText($passwordFile, $Password)
-} elseif (-not (Test-Path -LiteralPath $passwordFile)) {
-    Write-Host "Creating password file with default password: $passwordFile" -ForegroundColor Cyan
-    [System.IO.File]::WriteAllText($passwordFile, $defaultPassword)
-}
-$password = (Get-Content -LiteralPath $passwordFile -Raw).Trim()
-if (-not $password) { throw "Password file is empty: $passwordFile" }
-
 # --- Find opencode.exe ---
 $exe = @(
     "$env:LOCALAPPDATA\Microsoft\WinGet\Links\opencode.exe"
@@ -87,6 +107,11 @@ if (-not $exe) { throw "opencode.exe not found. Install via: winget install SST.
 # --- IMPORTANT: env vars are process-scoped only ---
 # NEVER set OPENCODE_* globally in the registry - it bricks the desktop client.
 $env:OPENCODE_SERVER_PASSWORD = $password
+
+# Launch the server from the user's home directory so ALL project directories
+# are visible. The mobile app's "Directory" field filters to one project.
+Push-Location -LiteralPath $homeDir
+try {
 
 Write-Host ""
 Write-Host "OpenCode Shared Server" -ForegroundColor Green
@@ -133,3 +158,4 @@ if ($Detached) {
         & $exe serve --hostname $bindHost --port $port
     }
 }
+} finally { Pop-Location }

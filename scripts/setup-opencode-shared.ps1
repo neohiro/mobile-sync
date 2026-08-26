@@ -62,10 +62,20 @@ function New-SecurePassword {
     return $result
 }
 
+# Helper: find the Tailscale executable. Prefers PATH, falls back to the
+# default install path so the script works regardless of how Tailscale was installed.
+function Resolve-Tailscale {
+    $cmd = Get-Command tailscale -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Path }
+    $default = "C:\Program Files\Tailscale\tailscale.exe"
+    if (Test-Path -LiteralPath $default) { return $default }
+    return $null
+}
+
 # Helper: detect Tailscale hostname
 function Get-TailscaleHostname {
-    $tsPath = "C:\Program Files\Tailscale\tailscale.exe"
-    if (-not (Test-Path $tsPath)) { return $null }
+    $tsPath = Resolve-Tailscale
+    if (-not $tsPath) { return $null }
     try {
         $tsJson = & $tsPath status --json 2>&1
         if ($LASTEXITCODE -ne 0) { return $null }
@@ -77,8 +87,8 @@ function Get-TailscaleHostname {
 
 # Helper: detect Tailscale full DNS name (for Funnel URL)
 function Get-TailscaleDnsName {
-    $tsPath = "C:\Program Files\Tailscale\tailscale.exe"
-    if (-not (Test-Path $tsPath)) { return $null }
+    $tsPath = Resolve-Tailscale
+    if (-not $tsPath) { return $null }
     try {
         $tsJson = & $tsPath status --json 2>&1
         if ($LASTEXITCODE -ne 0) { return $null }
@@ -88,7 +98,7 @@ function Get-TailscaleDnsName {
     return $null
 }
 
-$tsPath = "C:\Program Files\Tailscale\tailscale.exe"
+$tsPath = Resolve-Tailscale
 $passwordFile = "$env:USERPROFILE\.opencode-server-password"
 
 # --- Step 1: Verify prerequisites ---
@@ -174,7 +184,6 @@ if ($Rotate) {
     exit 0
 }
 
-$defaultPassword = 'NJYA0Uw1A7kePY8fv4BCftNH'
 if ($PSBoundParameters.ContainsKey('Password')) {
     if (-not $Password) { throw "-Password cannot be empty. Pass a non-empty value or omit the parameter." }
     Invoke-Step "Write password from parameter" -Action {
@@ -199,12 +208,14 @@ if ($PSBoundParameters.ContainsKey('Password')) {
         }
     }
 } else {
-    Invoke-Step "Create password file" -Action {
-        [System.IO.File]::WriteAllText($passwordFile, $defaultPassword)
+    Invoke-Step "Create password file (random)" -Action {
+        $newPw = New-SecurePassword
+        [System.IO.File]::WriteAllText($passwordFile, $newPw)
         Write-Host "  Password file created: $passwordFile" -ForegroundColor Green
+        Write-Host "  Generated password: $newPw" -ForegroundColor White
     } -Preview {
         Write-Host "    Would create: $passwordFile" -ForegroundColor DarkGray
-        Write-Host "    Value: $defaultPassword" -ForegroundColor DarkGray
+        Write-Host "    Value: (random 24 chars)" -ForegroundColor DarkGray
     }
 }
 

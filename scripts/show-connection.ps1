@@ -20,10 +20,19 @@ $ErrorActionPreference = 'Stop'
 $passwordFile = "$env:USERPROFILE\.opencode-server-password"
 $deviceRegistry = "$env:USERPROFILE\.opencode-devices.json"
 
+# --- Find Tailscale executable (PATH-first, then default install path) ---
+function Resolve-Tailscale {
+    $cmd = Get-Command tailscale -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Path }
+    $default = "C:\Program Files\Tailscale\tailscale.exe"
+    if (Test-Path -LiteralPath $default) { return $default }
+    return $null
+}
+
 # --- Detect this device's Tailscale hostname ---
 function Get-TailscaleHostname {
-    $tsPath = "C:\Program Files\Tailscale\tailscale.exe"
-    if (-not (Test-Path $tsPath)) { return $null }
+    $tsPath = Resolve-Tailscale
+    if (-not $tsPath) { return $null }
     try {
         $tsJson = & $tsPath status --json 2>&1
         if ($LASTEXITCODE -ne 0) { return $null }
@@ -35,8 +44,8 @@ function Get-TailscaleHostname {
 
 # --- Detect this device's Tailscale full DNS name (for Funnel URL) ---
 function Get-TailscaleDnsName {
-    $tsPath = "C:\Program Files\Tailscale\tailscale.exe"
-    if (-not (Test-Path $tsPath)) { return $null }
+    $tsPath = Resolve-Tailscale
+    if (-not $tsPath) { return $null }
     try {
         $tsJson = & $tsPath status --json 2>&1
         if ($LASTEXITCODE -ne 0) { return $null }
@@ -232,8 +241,8 @@ if ($hostname) {
     }
 
     # Check funnel status
-    $tsPath = "C:\Program Files\Tailscale\tailscale.exe"
-    if (Test-Path $tsPath) {
+    $tsPath = Resolve-Tailscale
+    if ($tsPath) {
         $funnelStatus = & $tsPath funnel status 2>&1
         if ($funnelStatus -match "4096") {
             Write-Host ""

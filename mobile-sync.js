@@ -15,6 +15,7 @@
  */
 
 import { execFile, spawn } from "node:child_process"
+import { randomBytes } from "node:crypto"
 import { readFile, writeFile, mkdir, rm, rename, readdir } from "node:fs/promises"
 import { readFileSync, writeFileSync, existsSync } from "node:fs"
 import { join, dirname } from "node:path"
@@ -61,7 +62,13 @@ const PS_EXE = "powershell.exe"
 const PS_FLAGS = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive"]
 
 const PASSWORD_FILE = join(homedir(), ".opencode-server-password")
-const DEFAULT_PASSWORD = "NJYA0Uw1A7kePY8fv4BCftNH"
+const DIRECTORY_FILE = join(homedir(), ".opencode-server-directory")
+const FUNNEL_URL_FILE = join(homedir(), ".opencode-funnel-url")
+/**
+ * Generate a cryptographically random URL-safe password (24 chars, ~142 bits entropy).
+ * Used on first install when no password file exists yet.
+ */
+const generatePassword = () => randomBytes(18).toString("base64url")
 
 /** Normalize any thrown value into a string for logging. Handles Error objects, strings, numbers, objects, nullish. */
 const errStr = (err) => err?.message ?? (typeof err === "string" ? err : JSON.stringify(err))
@@ -140,16 +147,55 @@ const pluginDir = (() => {
 /** Scripts live in a sibling directory to avoid auto-discovery conflicts. */
 const scriptsDir = pluginDir ? join(pluginDir, "mobile-sync-scripts") : null
 
-/** Read the password from disk, falling back to default. Empty or BOM-only file treated as missing. */
+/**
+ * Read the password from disk. On first run (no file), generate a random
+ * password, persist it, and return it. The user is shown this password once
+ * in the startup log so they can configure their mobile app.
+ * Empty, BOM-only, or corrupted files are regenerated (self-healing).
+ * NEVER falls back to a hardcoded value — every install gets a unique secret.
+ */
 function readPassword() {
+  let needsWrite = false
+  let raw = ""
   try {
-    // Strip UTF-8 BOM (\uFEFF) which some Windows editors add — would otherwise
-    // become part of the password and break Basic auth.
-    const raw = readFileSync(PASSWORD_FILE, "utf8").replace(/^\uFEFF/, "").trim()
-    if (raw.length > 0) return raw
-  } catch { /* file missing */ }
-  return DEFAULT_PASSWORD
+    // Strip UTF-8 BOM (\uFEFF) which some Windows editors add.
+    raw = readFileSync(PASSWORD_FILE, "utf8").replace(/^\uFEFF/, "").trim()
+  } catch (err) {
+    // File missing — first run.
+    needsWrite = true
+  }
+  if (!needsWrite && raw.length === 0) {
+    // File exists but is empty — treat as corrupted and regenerate.
+    needsWrite = true
+  }
+  if (needsWrite) {
+    const generated = generatePassword()
+    try {
+      writeFileSync(PASSWORD_FILE, generated + "\n", { mode: 0o600 })
+    } catch (err) {
+      // If we can't write (permissions, read-only fs), return the generated
+      // value for this session only. It won't persist across restarts.
+      logFnOnce("warn", "could not persist generated password; using ephemeral one", { error: errStr(err) })
+      return generated
+    }
+    return generated
+  }
+  return raw
 }
+
+/** Log a message at most once across the lifetime of the plugin. */
+const _loggedOnce = new Set()
+function logFnOnce(level, msg, extra) {
+  const key = `${level}:${msg}`
+  if (_loggedOnce.has(key)) return
+  _loggedOnce.add(key)
+  // Defer to the per-instance logFn defined in MobileSyncPlugin. If called
+  // before plugin init, fall back to console directly.
+  if (typeof _globalLogFn === "function") _globalLogFn(level, msg, extra)
+  else if (extra) console[level === "error" ? "error" : "log"](`[mobile-sync] ${msg} ${JSON.stringify(extra)}`)
+  else console[level === "error" ? "error" : "log"](`[mobile-sync] ${msg}`)
+}
+let _globalLogFn = null
 
 /** Run a PowerShell script file and return a promise. */
 function runPS(scriptPath, args = [], opts = {}) {
@@ -475,7 +521,20 @@ const MobileSyncPlugin = async ({ $ }) => {
   }
 
   const port = DEFAULT_PORT
-  const password = readPassword()
+  // Set up logging FIRST so readPassword() can log through it.
+  const TAG = "[mobile-sync]"
+  const logFn = (level, msg, extra) => {
+    const line = `${TAG} ${msg}`
+    const fn = level === "error" ? "error"
+      : level === "warn" ? "warn"
+      : level === "debug" ? "debug"
+      : "log"
+    if (extra) console[fn](`${line} ${JSON.stringify(extra)}`)
+    else console[fn](line)
+  }
+  _globalLogFn = logFn
+
+  const password = readPassword()  // may log a one-time warning if regeneration occurred
   let watcherProc = null
   let launcherPid = null   // PID of the PowerShell wrapper that launched the sidecar
   let updateTimer = null
@@ -487,25 +546,14 @@ const MobileSyncPlugin = async ({ $ }) => {
   let relaunching = false  // debounce guard for concurrent event-driven relaunch
   const osNotify = createOsNotifier({ $ })
 
-  const TAG = "[mobile-sync]"
-  const logFn = (level, msg, extra) => {
-    const line = `${TAG} ${msg}`
-    const fn = level === "error" ? "error"
-      : level === "warn" ? "warn"
-      : level === "debug" ? "debug"
-      : "log"
-    if (extra) console[fn](`${line} ${JSON.stringify(extra)}`)
-    else console[fn](line)
-  }
-
-  logFn("info", `v${MOBILE_SYNC_VERSION} loading`)
-
-  // Mask password: show last 4 chars (consistent with PS1 scripts).
-  // Guard against empty password — `readPassword` falls back to DEFAULT_PASSWORD
-  // but be defensive in case the file is corrupted to an empty string.
+  // Mask password: show last 4 chars so the user can still identify it.
+  // Show the full value ONCE at startup — this is the only time the user
+  // will see it. They must copy it into the Android app's connection config.
   const maskedPw = password
     ? (password.length <= 4 ? "*".repeat(password.length) : "*".repeat(password.length - 4) + password.slice(-4))
     : "(not set)"
+  logFn("info", `v${MOBILE_SYNC_VERSION} loading`)
+  logFn("info", `PASSWORD: ${password}  <-- copy this into the Android app`)
   logFn("info", `hooks ready (port ${port}, password ${maskedPw})`)
 
   // Set up hourly update check (with error handling)
