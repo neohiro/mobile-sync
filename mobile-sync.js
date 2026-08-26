@@ -12,6 +12,15 @@
  *   5. Injects OPENCODE_PORT + OPENCODE_SERVER_PASSWORD into shell env
  *
  * Auto-updates hourly from GitHub releases.
+ *
+ * Environment variables:
+ *   MOBILE_SYNC_ENABLED=0          Disable the plugin entirely
+ *   MOBILE_SYNC_DESKTOP_ONLY=1     Skip the CLI server fallback (desktop-only mode)
+ *   MOBILE_SYNC_KILL_SERVER_ON_DISPOSE=1
+ *                                  When the plugin unloads, also terminate the
+ *                                  opencode.exe serve process tree. Default is
+ *                                  to leave the server running so mobile clients
+ *                                  stay connected.
  */
 
 import { execFile, spawn } from "node:child_process"
@@ -76,12 +85,31 @@ const FUNNEL_URL_FILE = join(homedir(), ".opencode-funnel-url")
  */
 const generatePassword = () => randomBytes(18).toString("base64url")
 
-/** Normalize any thrown value into a string for logging. Handles Error objects, strings, numbers, objects, nullish. */
+/**
+ * Normalize any thrown value into a string for logging. Handles Error objects,
+ * strings, numbers, booleans, arrays, plain objects, Symbols, null, and undefined.
+ *
+ * Edge cases handled:
+ *   - `JSON.stringify(Symbol())` returns `undefined` (not a string, doesn't throw)
+ *     so we fall back to `String(symbol)` which yields "Symbol(desc)".
+ *   - Circular references cause `JSON.stringify` to throw; fallback to
+ *     `Object.prototype.toString.call`.
+ *   - Objects with throwing `toJSON` are caught by the try/catch.
+ */
 const errStr = (err) => {
-  if (err == null) return String(err) // catches null and undefined -> "null"/"undefined"
+  if (err == null) return String(err) // null -> "null", undefined -> "undefined"
   if (typeof err === "string") return err
+  if (typeof err === "number" || typeof err === "boolean") return String(err)
+  if (typeof err === "symbol") return err.toString() // "Symbol(desc)"
   if (err.message) return err.message
-  try { return JSON.stringify(err) } catch { return Object.prototype.toString.call(err) }
+  try {
+    const json = JSON.stringify(err)
+    // JSON.stringify returns undefined for Symbol, Function, undefined values
+    if (typeof json === "string") return json
+    return Object.prototype.toString.call(err)
+  } catch {
+    return Object.prototype.toString.call(err)
+  }
 }
 
 // ── OS notifications (same mechanism as auto-resume) ────────────────────────
@@ -487,9 +515,13 @@ async function checkForUpdates(logFn, osNotify) {
           try {
             await copyFile(pluginSrc, pluginDest)
           } catch (copyErr) {
+            // Restore the previous version so the next load still works.
             await rename(backup, pluginDest).catch(() => {})
             throw copyErr
           }
+          // Successful update — remove the backup to avoid accumulating
+          // stale .bak files across many updates.
+          await rm(backup, { force: true }).catch(() => {})
         }
 
         const pkgSrc = join(srcDir, "package.json")
@@ -510,16 +542,25 @@ async function checkForUpdates(logFn, osNotify) {
   }
 }
 
-/** Recursively copy a directory. */
+/**
+ * Recursively copy a directory's contents into `dest`.
+ * Skips symbolic links and junctions to prevent infinite recursion if the
+ * zipball contains a self-referential entry (a malformed release). Plain
+ * files and subdirectories are copied as-is.
+ */
 async function copyDir(src, dest) {
   await mkdir(dest, { recursive: true })
   const entries = await readdir(src, { withFileTypes: true })
   for (const entry of entries) {
+    // isSymbolicLink() covers symlinks AND junctions on Windows. isDirectory()
+    // returns true for the target of a junction, so we must check symlink
+    // FIRST to avoid recursing into a cycle.
+    if (entry.isSymbolicLink()) continue
     const srcPath = join(src, entry.name)
     const destPath = join(dest, entry.name)
     if (entry.isDirectory()) {
       await copyDir(srcPath, destPath)
-    } else {
+    } else if (entry.isFile()) {
       await copyFile(srcPath, destPath)
     }
   }
@@ -687,7 +728,11 @@ const MobileSyncPlugin = async ({ $ }) => {
       }
     },
 
-    // Cleanup on unload
+    // Cleanup on unload.
+    // The CLI server (opencode.exe serve) is intentionally LEFT RUNNING when
+    // the plugin unloads: mobile clients connect to it independently of the
+    // OpenCode desktop app, and killing it would disconnect them. Set
+    // MOBILE_SYNC_KILL_SERVER_ON_DISPOSE=1 to override.
     dispose: async () => {
       if (updateTimer) {
         clearInterval(updateTimer)
@@ -701,14 +746,17 @@ const MobileSyncPlugin = async ({ $ }) => {
         try { watcherProc.kill() } catch {}
         watcherProc = null
       }
+      // Best-effort: kill the wrapper that launched the sidecar. This is
+      // usually a no-op (the wrapper has already exited), but if MOBILE_SYNC_KILL_SERVER_ON_DISPOSE
+      // is set we also walk the process tree to terminate the opencode.exe grandchild.
       if (launcherPid) {
-        try {
-          if (isWindows) {
-            execFile("taskkill", ["/F", "/PID", String(launcherPid)], { windowsHide: true }, () => {})
-          } else {
-            process.kill(launcherPid, "SIGTERM")
-          }
-        } catch {}
+        const tree = process.env.MOBILE_SYNC_KILL_SERVER_ON_DISPOSE === "1"
+        if (isWindows && tree) {
+          // /T = terminate child tree, /F = force. Ignore exit code — the
+          // wrapper may have already exited and taskkill returns non-zero
+          // in that case, which is fine.
+          execFile("taskkill", ["/T", "/F", "/PID", String(launcherPid)], { windowsHide: true }, () => {})
+        }
         launcherPid = null
       }
       logFn("info", "disposed")

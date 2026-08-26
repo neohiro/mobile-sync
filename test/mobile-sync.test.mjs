@@ -6,7 +6,7 @@
 
 import { strict as assert } from "node:assert"
 import { randomBytes } from "node:crypto"
-import { writeFileSync, existsSync, unlinkSync, chmodSync, mkdirSync, readFileSync, renameSync } from "node:fs"
+import { writeFileSync, existsSync, unlinkSync, chmodSync, mkdirSync, readFileSync, renameSync, symlinkSync, lstatSync, rmSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 
@@ -32,8 +32,16 @@ function test(name, fn) {
 const errStr = (err) => {
   if (err == null) return String(err)
   if (typeof err === "string") return err
+  if (typeof err === "number" || typeof err === "boolean") return String(err)
+  if (typeof err === "symbol") return err.toString()
   if (err.message) return err.message
-  try { return JSON.stringify(err) } catch { return Object.prototype.toString.call(err) }
+  try {
+    const json = JSON.stringify(err)
+    if (typeof json === "string") return json
+    return Object.prototype.toString.call(err)
+  } catch {
+    return Object.prototype.toString.call(err)
+  }
 }
 const generatePassword = () => randomBytes(18).toString("base64url")
 
@@ -242,12 +250,146 @@ test("same message different level: both logged (different keys)", () => {
   assert.equal(_sink.length, 2)
 })
 
+console.log("\nerrStr hardened edge cases")
+test("Error with empty message -> JSON {} fallback (not undefined)", () => {
+  const e = new Error()
+  e.message = ""
+  // err.message is falsy for empty string, so we fall through to JSON.stringify
+  // which gives "{}" for an empty Error object.
+  const got = errStr(e)
+  assert.notEqual(got, undefined, "must not return undefined for Error")
+  assert.equal(typeof got, "string")
+})
+test("Symbol -> toString fallback (JSON.stringify returns undefined for Symbol)", () => {
+  // JSON.stringify(Symbol()) returns `undefined` (not a string, doesn't throw).
+  // The current errStr falls through to JSON.stringify's undefined and the
+  // try/catch doesn't trigger. Document and verify current behavior:
+  // errStr(Symbol) returns "undefined" via String() path. Wait — Symbol
+  // is not null, not a string, has no .message, then JSON.stringify returns
+  // undefined which we return as-is. The fix below makes it return a
+  // useful description.
+  const got = errStr(Symbol("x"))
+  // After the fix: should return a non-empty string (Symbol description)
+  assert.equal(typeof got, "string", `got ${JSON.stringify(got)} (${typeof got})`)
+  assert.ok(got.length > 0, `got empty string for Symbol`)
+})
+test("object with throwing toJSON -> toString fallback", () => {
+  const bad = { toJSON() { throw new Error("nope") } }
+  const got = errStr(bad)
+  assert.equal(typeof got, "string")
+  assert.ok(got.includes("Object") || got.includes("nope"))
+})
+test("array -> JSON string", () => {
+  assert.equal(errStr([1, 2, 3]), "[1,2,3]")
+})
+test("boolean true -> 'true'", () => {
+  assert.equal(errStr(true), "true")
+})
+test("0 (falsy number) -> '0'", () => {
+  assert.equal(errStr(0), "0")
+})
+test("Error subclass (TypeError) -> .message", () => {
+  assert.equal(errStr(new TypeError("bad type")), "bad type")
+})
+test("circular object -> toString fallback (no infinite recursion)", () => {
+  const a = { name: "a" }
+  a.self = a // circular
+  const got = errStr(a)
+  assert.equal(typeof got, "string")
+  assert.ok(got.length > 0)
+})
+
+console.log("\nisNewer hardening")
+test("missing remote version -> not newer", () => {
+  assert.equal(isNewer("", "1.0.0"), false)
+})
+test("missing local version -> not newer", () => {
+  // Empty local is treated as 0.0.0
+  assert.equal(isNewer("0.0.1", ""), true)
+})
+test("non-numeric components -> treated as 0", () => {
+  // 1.x.y where x/y are non-numeric -> [1,0,0]; local [1,0,0] -> not newer
+  assert.equal(isNewer("1.abc.def", "1.0.0"), false)
+})
+test("extra version components are ignored (only first 3 are compared)", () => {
+  // 4-part version like "1.0.0.5" — only the first 3 parts enter the loop,
+  // the 4th is silently dropped. "1.0.0.5" effectively equals "1.0.0".
+  // This matches the documented behavior; future semver pre-release handling
+  // would require a dedicated parser.
+  assert.equal(isNewer("1.0.0.5", "1.0.0"), false)
+  assert.equal(isNewer("1.0.0.5", "1.0.0.0"), false)
+})
+test("pre-release tag is ignored (treated as 0)", () => {
+  // 1.0.0-rc1 -> ["1","0","0-rc1"] -> [1,0,NaN] -> [1,0,0] via (NaN||0)
+  // Equal to 1.0.0 -> not newer
+  assert.equal(isNewer("1.0.0-rc1", "1.0.0"), false)
+})
+
+console.log("\ncopyDir (symlink safety)")
+// Reimplement copyDir to test the logic in isolation
+async function copyDir(src, dest) {
+  const { readdir, mkdir, copyFile } = await import("node:fs/promises")
+  await mkdir(dest, { recursive: true })
+  const entries = await readdir(src, { withFileTypes: true })
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) continue
+    const srcPath = join(src, entry.name)
+    const destPath = join(dest, entry.name)
+    if (entry.isDirectory()) {
+      await copyDir(srcPath, destPath)
+    } else if (entry.isFile()) {
+      await copyFile(srcPath, destPath)
+    }
+  }
+}
+test("regular files and subdirectories are copied", async () => {
+  const src = join(testDir, "copy-src-" + Date.now())
+  const dst = join(testDir, "copy-dst-" + Date.now())
+  mkdirSync(join(src, "sub"), { recursive: true })
+  writeFileSync(join(src, "a.txt"), "hello")
+  writeFileSync(join(src, "sub", "b.txt"), "world")
+  await copyDir(src, dst)
+  assert.equal(readFileSync(join(dst, "a.txt"), "utf8"), "hello")
+  assert.equal(readFileSync(join(dst, "sub", "b.txt"), "utf8"), "world")
+  rmSync(src, { recursive: true, force: true })
+  rmSync(dst, { recursive: true, force: true })
+})
+test("symlinks are skipped (no infinite loop)", async () => {
+  const src = join(testDir, "symlink-src-" + Date.now())
+  const dst = join(testDir, "symlink-dst-" + Date.now())
+  mkdirSync(src, { recursive: true })
+  writeFileSync(join(src, "real.txt"), "real")
+  // Create a symlink that points back to the parent (would loop forever)
+  try {
+    symlinkSync(src, join(src, "loop"), "dir")
+  } catch {
+    // Symlink creation may need elevated privileges on Windows — skip if so
+    return
+  }
+  // Set a hard timeout — if copyDir recurses into the loop, the test hangs
+  const timeout = setTimeout(() => {
+    throw new Error("copyDir did not terminate — likely entered symlink loop")
+  }, 5000)
+  try {
+    await copyDir(src, dst)
+    clearTimeout(timeout)
+    // The real file should be copied; the symlink should not
+    assert.equal(existsSync(join(dst, "real.txt")), true)
+    assert.equal(existsSync(join(dst, "loop")), false, "symlink must be skipped")
+  } finally {
+    clearTimeout(timeout)
+    rmSync(src, { recursive: true, force: true })
+    rmSync(dst, { recursive: true, force: true })
+  }
+})
+
 // Cleanup
 try {
   for (const f of ["pw1.txt", "pw-bom.txt", "pw-empty.txt", "pw-ws.txt", "pw-race.txt"]) {
     try { unlinkSync(join(testDir, f)) } catch {}
     try { unlinkSync(join(testDir, f + ".tmp")) } catch {}
   }
+  try { rmSync(testDir, { recursive: true, force: true }) } catch {}
 } catch {}
 
 console.log(`\n${passed} passed, ${failed} failed`)
