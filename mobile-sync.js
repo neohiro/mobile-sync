@@ -125,10 +125,12 @@ const pluginDir = (() => {
 /** Scripts live in a sibling directory to avoid auto-discovery conflicts. */
 const scriptsDir = pluginDir ? join(pluginDir, "mobile-sync-scripts") : null
 
-/** Read the password from disk, falling back to default. Empty file treated as missing. */
+/** Read the password from disk, falling back to default. Empty or BOM-only file treated as missing. */
 function readPassword() {
   try {
-    const raw = readFileSync(PASSWORD_FILE, "utf8").trim()
+    // Strip UTF-8 BOM (\uFEFF) which some Windows editors add — would otherwise
+    // become part of the password and break Basic auth.
+    const raw = readFileSync(PASSWORD_FILE, "utf8").replace(/^\uFEFF/, "").trim()
     if (raw.length > 0) return raw
   } catch { /* file missing */ }
   return DEFAULT_PASSWORD
@@ -312,7 +314,11 @@ async function checkForUpdates(logFn, osNotify) {
       "user-agent": `mobile-sync-plugin/${MOBILE_SYNC_VERSION}`,
       accept: "application/vnd.github.v3+json",
     }
-    if (cache.etag) headers["if-none-match"] = cache.etag
+    // Validate ETag before sending as header — guards against malformed cache
+    // file. ETags from GitHub are quoted strings like W/"abc..." or "abc...".
+    if (typeof cache.etag === "string" && /^[\w"-]{8,128}$/.test(cache.etag)) {
+      headers["if-none-match"] = cache.etag
+    }
 
     const res = await fetch(
       `${GITHUB_API_BASE}/repos/${GITHUB_REPO}/releases/latest`,
@@ -362,8 +368,11 @@ async function checkForUpdates(logFn, osNotify) {
 
       if (isWindows) {
         const extractDir = join(tempDir, "extracted")
+        // Use psQuote (PowerShell single-quote escape) for defense-in-depth.
+        // Paths here come from Date.now()/tmpdir() (safe today) but this guards
+        // against any future path containing a single quote.
         await runPSCommand(
-          `Expand-Archive -Path '${zipPath}' -DestinationPath '${extractDir}' -Force`,
+          `Expand-Archive -Path ${psQuote(zipPath)} -DestinationPath ${psQuote(extractDir)} -Force`,
           { timeout: 30_000 }
         )
 
@@ -382,7 +391,17 @@ async function checkForUpdates(logFn, osNotify) {
         if (existsSync(pluginSrc)) {
           const pluginDest = join(pluginDir, "mobile-sync.js")
           const backup = `${pluginDest}.bak`
-          await rename(pluginDest, backup).catch(() => {})
+          try {
+            await rename(pluginDest, backup)
+          } catch (renameErr) {
+            // File may be locked (still loaded by host). Log and abort update —
+            // overwriting without a backup would brick the plugin permanently.
+            logFn("warn", "could not back up plugin file, skipping update", {
+              error: renameErr?.message,
+              hint: "plugin may be loaded by host; restart and retry",
+            })
+            return
+          }
           try {
             await copyFile(pluginSrc, pluginDest)
           } catch (copyErr) {
@@ -506,9 +525,11 @@ const MobileSyncPlugin = async ({ $ }) => {
 
       // Delayed startup toast — shows after GUI has loaded (5s).
       // Tracked so dispose can cancel it if plugin unloads before it fires.
+      // .catch guards against unhandled rejection in the fire-and-forget timer.
       startupToastTimer = setTimeout(() => {
         startupToastTimer = null
         osNotify("mobile-sync Ready", `v${MOBILE_SYNC_VERSION} active on port ${port}`)
+          .catch((err) => logFn("debug", "startup toast failed", { error: err?.message }))
       }, 5_000)
       if (startupToastTimer?.unref) startupToastTimer.unref()
     } catch (err) {
