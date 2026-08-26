@@ -163,7 +163,13 @@ function runPSCommand(command, opts = {}) {
   })
 }
 
-/** Check if a TCP port is listening on localhost. Pure Node — no PowerShell overhead. */
+/**
+ * Check if a TCP port is listening on localhost (IPv4 only).
+ * Pure Node — no PowerShell overhead (8ms vs ~500ms).
+ * family: 4 is intentional: the opencode sidecar/CLI binds to 127.0.0.1.
+ * If a future version binds to IPv6 (::1), this will false-negative —
+ * update family to 0 (dual-stack) and host to "localhost".
+ */
 function isPortListening(port) {
   return new Promise((resolve) => {
     const socket = createConnection({ host: "127.0.0.1", port, family: 4 })
@@ -424,7 +430,7 @@ async function copyFile(src, dest) {
 
 // ── Plugin Export ───────────────────────────────────────────────────────────
 
-const MobileSyncPlugin = async ({ client, $ }) => {
+const MobileSyncPlugin = async ({ $ }) => {
   // Allow disabling via env var (0/false/off = disabled)
   const enabled = (process.env.MOBILE_SYNC_ENABLED ?? "1").toLowerCase()
   if (["0", "false", "off"].includes(enabled)) {
@@ -436,6 +442,7 @@ const MobileSyncPlugin = async ({ client, $ }) => {
   let watcherProc = null
   let launcherPid = null   // PID of the PowerShell wrapper that launched the sidecar
   let updateTimer = null
+  let startupToastTimer = null
   let lastUpdateCheckAt = 0
   let lastRelaunchAt = 0    // wall-clock of last relaunch attempt
   let portWasDown = false   // true while port is known to be down (cooldown gates on this)
@@ -446,8 +453,12 @@ const MobileSyncPlugin = async ({ client, $ }) => {
   const TAG = "[mobile-sync]"
   const logFn = (level, msg, extra) => {
     const line = `${TAG} ${msg}`
-    if (extra) console[level === "error" ? "error" : "log"](`${line} ${JSON.stringify(extra)}`)
-    else console[level === "error" ? "error" : "log"](line)
+    const fn = level === "error" ? "error"
+      : level === "warn" ? "warn"
+      : level === "debug" ? "debug"
+      : "log"
+    if (extra) console[fn](`${line} ${JSON.stringify(extra)}`)
+    else console[fn](line)
   }
 
   logFn("info", `v${MOBILE_SYNC_VERSION} loading`)
@@ -473,7 +484,7 @@ const MobileSyncPlugin = async ({ client, $ }) => {
   // ── Deferred init: run heavy work AFTER returning hooks ──
   // This prevents the plugin from blocking OpenCode's GUI startup.
   // All errors are caught so a failure here never bricks the client.
-  const deferredInit = (async () => {
+  (async () => {
     try {
       await runFirstTimeSetup(logFn)
 
@@ -493,11 +504,13 @@ const MobileSyncPlugin = async ({ client, $ }) => {
 
       logFn("info", `initialized (port ${port})`)
 
-      // Delayed startup toast — shows after GUI has loaded (5s)
-      const startupToast = setTimeout(() => {
+      // Delayed startup toast — shows after GUI has loaded (5s).
+      // Tracked so dispose can cancel it if plugin unloads before it fires.
+      startupToastTimer = setTimeout(() => {
+        startupToastTimer = null
         osNotify("mobile-sync Ready", `v${MOBILE_SYNC_VERSION} active on port ${port}`)
       }, 5_000)
-      if (startupToast.unref) startupToast.unref()
+      if (startupToastTimer?.unref) startupToastTimer.unref()
     } catch (err) {
       logFn("error", "deferred init failed", { error: err?.message })
     }
@@ -506,12 +519,20 @@ const MobileSyncPlugin = async ({ client, $ }) => {
   // ── Hooks (returned immediately, never blocks) ──
   return {
     // Inject OPENCODE_PORT + OPENCODE_SERVER_PASSWORD into shell command env.
-    // SECURITY: the password is injected as plain text into every shell command's
-    // env so users can curl/wget the server without re-typing the password. The
-    // auth scheme is Basic — these env vars are equivalent to bearer tokens.
-    // Mitigations: only set if not already present in output.env (respect
-    // explicit user overrides), and the password is read from a per-user file
-    // that the user already controls (chmod 600 on POSIX).
+    // SECURITY: the password is injected as plain text into EVERY shell command
+    // run by OpenCode (not just opencode-related ones). This means `env`, error
+    // messages, and any process the shell spawns can see it. The auth scheme
+    // is HTTP Basic — these env vars are equivalent to bearer tokens.
+    //
+    // This is by design: the user explicitly set up the shared server, and
+    // injecting the env avoids re-typing the password for every curl/wget
+    // command. Mitigations:
+    //   - Only set if not already present in output.env (explicit overrides win)
+    //   - Password is read from a per-user file the user already controls
+    //   - The opencode server uses Basic auth over Tailscale Funnel (TLS),
+    //     so the password only travels over encrypted channels
+    //   - Users on multi-tenant systems should set OPENCODE_SERVER_PASSWORD
+    //     themselves to override (the if-not-present check respects this)
     "shell.env": async (_input, output) => {
       if (!output.env.OPENCODE_PORT) {
         output.env.OPENCODE_PORT = String(port)
@@ -564,6 +585,10 @@ const MobileSyncPlugin = async ({ client, $ }) => {
       if (updateTimer) {
         clearInterval(updateTimer)
         updateTimer = null
+      }
+      if (startupToastTimer) {
+        clearTimeout(startupToastTimer)
+        startupToastTimer = null
       }
       if (watcherProc) {
         try { watcherProc.kill() } catch {}
