@@ -70,19 +70,23 @@ if ($AllDevices) {
         exit 0
     }
 
-    $devices = Get-Content -LiteralPath $deviceRegistry -Raw | ConvertFrom-Json
+    $raw = Get-Content -LiteralPath $deviceRegistry -Raw | ConvertFrom-Json
+    # Normalize to array (handles legacy single-object format and PSCollection wrapper)
+    $devices = @($raw)
     if ($devices.Count -eq 0) {
         Write-Host "No devices registered." -ForegroundColor Yellow
         exit 0
     }
 
     foreach ($device in $devices) {
+        if (-not $device.Hostname) { continue }  # skip non-device entries
         $lastSeen = if ($device.LastSeen) { $device.LastSeen } else { "unknown" }
+        $pwLen = if ($device.Password) { $device.Password.Length } else { 0 }
         Write-Host ""
         Write-Host "  $($device.Name)" -ForegroundColor Green
         Write-Host "    URL:      $($device.URL)" -ForegroundColor Gray
         Write-Host "    User:     opencode" -ForegroundColor Gray
-        Write-Host "    Password: $('*' * ([math]::Max(0, $device.Password.Length - 4)))" -ForegroundColor Gray
+        Write-Host "    Password: $('*' * [math]::Max(0, $pwLen - 4))" -ForegroundColor Gray
         Write-Host "    Last seen: $lastSeen" -ForegroundColor DarkGray
     }
     Write-Host ""
@@ -115,34 +119,36 @@ if ($Register) {
         LastSeen = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
     }
 
-    # Load existing registry or create new
-    $devices = @()
+    # Load existing registry or create new (use ArrayList to avoid += wrapping)
+    $devices = [System.Collections.ArrayList]::new()
     if (Test-Path -LiteralPath $deviceRegistry) {
         try {
-            $devices = @(Get-Content -LiteralPath $deviceRegistry -Raw | ConvertFrom-Json)
+            foreach ($d in (Get-Content -LiteralPath $deviceRegistry -Raw | ConvertFrom-Json | Where-Object { $_.Hostname })) {
+                [void]$devices.Add($d)
+            }
         } catch {
-            $devices = @()
+            $devices = [System.Collections.ArrayList]::new()
         }
     }
 
     # Update existing entry or add new
     $existing = $devices | Where-Object { $_.Hostname -eq $hostname }
     if ($existing) {
-        $devices = $devices | ForEach-Object {
-            if ($_.Hostname -eq $hostname) {
-                $entry
-            } else {
-                $_
-            }
+        $newDevices = [System.Collections.ArrayList]::new()
+        foreach ($d in $devices) {
+            if ($d.Hostname -eq $hostname) { [void]$newDevices.Add($entry) }
+            else { [void]$newDevices.Add($d) }
         }
+        $devices = $newDevices
         Write-Host "Updated device: $deviceName ($url)" -ForegroundColor Green
     } else {
-        $devices += $entry
+        [void]$devices.Add($entry)
         Write-Host "Registered device: $deviceName ($url)" -ForegroundColor Green
     }
 
-    # Save registry
-    $devices | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $deviceRegistry -Encoding UTF8
+    # Save registry — use .NET to write without BOM (PS5.1 Set-Content/Out-File add BOM)
+    $jsonContent = ConvertTo-Json -InputObject $devices -Depth 4
+    [System.IO.File]::WriteAllText($deviceRegistry, $jsonContent, [System.Text.UTF8Encoding]::new($false))
     Write-Host "Registry saved to: $deviceRegistry" -ForegroundColor Gray
     exit 0
 }
@@ -189,7 +195,7 @@ if ($hostname) {
     $registered = $false
     if (Test-Path -LiteralPath $deviceRegistry) {
         try {
-            $devices = @(Get-Content -LiteralPath $deviceRegistry -Raw | ConvertFrom-Json)
+            $devices = @(Get-Content -LiteralPath $deviceRegistry -Raw | ConvertFrom-Json | Where-Object { $_.Hostname })
             $registered = ($devices | Where-Object { $_.Hostname -eq $hostname }) -ne $null
         } catch { }
     }

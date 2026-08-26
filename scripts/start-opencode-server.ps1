@@ -85,7 +85,9 @@ Write-Host ""
 Write-Host "OpenCode Shared Server" -ForegroundColor Green
 Write-Host "  Address:  ${bindHost}:${port}" -ForegroundColor Gray
 Write-Host "  User:     opencode" -ForegroundColor Gray
-Write-Host "  Password: $('*' * ([math]::Max(0, $password.Length - 4)))" -ForegroundColor Gray
+$maskLen = [math]::Max(0, $password.Length - 4)
+$masked = ('*' * $maskLen) + $password.Substring($maskLen)
+Write-Host "  Password: $masked" -ForegroundColor Gray
 if ($funnelUrl) {
     Write-Host "  Funnel:   $funnelUrl -> ${bindHost}:${port}" -ForegroundColor Cyan
 } else {

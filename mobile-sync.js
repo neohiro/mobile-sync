@@ -1,16 +1,17 @@
 /**
  * mobile-sync — OpenCode plugin
  *
- * Makes the patched desktop sidecar act as a shared server on port 4096,
- * accessible via Tailscale Funnel for mobile sync.
+ * Makes the desktop sidecar (or CLI server as fallback) act as a shared server
+ * on port 4096, accessible via Tailscale Funnel for mobile sync.
  *
  * On startup:
  *   1. Runs first-time setup if needed (password file, patch, funnel)
  *   2. Launches the desktop sidecar if port 4096 is not listening
- *   3. Starts the auto-repatch watcher
- *   4. Injects OPENCODE_PORT + OPENCODE_SERVER_PASSWORD into shell env
+ *   3. Falls back to CLI server if desktop is unavailable
+ *   4. Starts the auto-repatch watcher
+ *   5. Injects OPENCODE_PORT + OPENCODE_SERVER_PASSWORD into shell env
  *
- * Auto-updates daily from GitHub releases.
+ * Auto-updates hourly from GitHub releases.
  */
 
 import { execFile, spawn } from "node:child_process"
@@ -108,14 +109,13 @@ const pluginDir = (() => {
 /** Scripts live in a sibling directory to avoid auto-discovery conflicts. */
 const scriptsDir = pluginDir ? join(pluginDir, "mobile-sync-scripts") : null
 
-/** Read the password from disk, falling back to default. */
+/** Read the password from disk, falling back to default. Empty file treated as missing. */
 function readPassword() {
   try {
     const raw = readFileSync(PASSWORD_FILE, "utf8").trim()
-    return raw || DEFAULT_PASSWORD
-  } catch {
-    return DEFAULT_PASSWORD
-  }
+    if (raw.length > 0) return raw
+  } catch { /* file missing */ }
+  return DEFAULT_PASSWORD
 }
 
 /** Run a PowerShell script file and return a promise. */
@@ -207,17 +207,23 @@ async function ensureSidecarRunning(logFn) {
     return { launched: false, pid: null }
   }
 
-  const launcher = join(scriptsDir, "start-opencode-desktop.ps1")
-  if (!existsSync(launcher)) {
-    logFn("warn", "desktop launcher not found", { path: launcher })
+  // CLI fallback: skip if MOBILE_SYNC_DESKTOP_ONLY is set
+  if (process.env.MOBILE_SYNC_DESKTOP_ONLY === "1") {
+    logFn("info", "MOBILE_SYNC_DESKTOP_ONLY=1, not starting CLI fallback")
     return { launched: false, pid: null }
   }
 
-  logFn("info", "launching desktop sidecar...")
+  const launcher = join(scriptsDir, "start-opencode-server.ps1")
+  if (!existsSync(launcher)) {
+    logFn("warn", "server launcher not found", { path: launcher })
+    return { launched: false, pid: null }
+  }
+
+  logFn("info", "launching CLI server (desktop not running)...")
   try {
     // Launch detached (non-blocking). Node's detached: true handles process
     // survival — do NOT also pass -Detached to the script (conflicts).
-    const child = spawn(PS_EXE, [...PS_FLAGS, "-File", launcher], {
+    const child = spawn(PS_EXE, [...PS_FLAGS, "-File", launcher, "-Detached"], {
       windowsHide: true,
       detached: true,
       stdio: "ignore",
@@ -228,14 +234,14 @@ async function ensureSidecarRunning(logFn) {
     for (let i = 0; i < 30; i++) {
       await new Promise((r) => setTimeout(r, 500))
       if (await isPortListening(DEFAULT_PORT)) {
-        logFn("info", `sidecar ready on port ${DEFAULT_PORT}`)
+        logFn("info", `CLI server ready on port ${DEFAULT_PORT}`)
         return { launched: true, pid: child.pid }
       }
     }
-    logFn("warn", `sidecar not listening after 15s on port ${DEFAULT_PORT}`)
+    logFn("warn", `CLI server not listening after 15s on port ${DEFAULT_PORT}`)
     return { launched: false, pid: child.pid }
   } catch (err) {
-    logFn("error", "failed to launch sidecar", { error: err?.message })
+    logFn("error", "failed to launch CLI server", { error: err?.message })
     return { launched: false, pid: null }
   }
 }
@@ -415,10 +421,12 @@ const MobileSyncPlugin = async ({ client, $ }) => {
 
   logFn("info", `v${MOBILE_SYNC_VERSION} loading`)
 
-  // Mask password: show last 4 chars (consistent with PS1 scripts)
-  const maskedPw = password.length <= 4
-    ? "*".repeat(password.length)
-    : "*".repeat(password.length - 4) + password.slice(-4)
+  // Mask password: show last 4 chars (consistent with PS1 scripts).
+  // Guard against empty password — `readPassword` falls back to DEFAULT_PASSWORD
+  // but be defensive in case the file is corrupted to an empty string.
+  const maskedPw = password
+    ? (password.length <= 4 ? "*".repeat(password.length) : "*".repeat(password.length - 4) + password.slice(-4))
+    : "(not set)"
   logFn("info", `hooks ready (port ${port}, password ${maskedPw})`)
 
   // Set up hourly update check (with error handling)
@@ -441,7 +449,11 @@ const MobileSyncPlugin = async ({ client, $ }) => {
       const sidecar = await ensureSidecarRunning(logFn)
       launcherPid = sidecar.pid
 
-      if (sidecar.launched || (await isPortListening(port))) {
+      // Start watcher only if desktop is installed (watcher re-patches desktop app.asar).
+      // CLI server doesn't need a watcher.
+      const desktopInstalled = existsSync(join(scriptsDir, "start-opencode-desktop.ps1"))
+      const portIsUp = sidecar.launched || (await isPortListening(port))
+      if (portIsUp && desktopInstalled) {
         watcherProc = startWatcher(logFn)
       }
 

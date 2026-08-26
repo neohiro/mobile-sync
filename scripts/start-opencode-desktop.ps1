@@ -75,7 +75,9 @@ $env:OPENCODE_SERVER_PASSWORD = $password
 Write-Host ""
 Write-Host "OpenCode Desktop (Patched)" -ForegroundColor Green
 Write-Host "  Sidecar port:  $port" -ForegroundColor Gray
-Write-Host "  Password:      $('*' * ([math]::Max(0, $password.Length - 4)))" -ForegroundColor Gray
+$maskLen = [math]::Max(0, $password.Length - 4)
+$masked = ('*' * $maskLen) + $password.Substring($maskLen)
+Write-Host "  Password:      $masked" -ForegroundColor Gray
 Write-Host "  DB:            ~/.local/share/opencode/opencode.db" -ForegroundColor Gray
 Write-Host ""
 
