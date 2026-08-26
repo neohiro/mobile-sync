@@ -34,8 +34,20 @@ function loadCache() {
   try {
     const raw = readFileSync(CACHE_FILE, "utf8").trim()
     if (!raw) return {}
-    return JSON.parse(raw)
-  } catch { return {} }
+    const parsed = JSON.parse(raw)
+    // Self-heal: if the file is structurally invalid (not an object), delete it
+    // so the next saveCache() creates a fresh one. Otherwise we'd be stuck with
+    // a broken cache forever (saveCache only runs on successful API responses).
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      try { writeFileSync(CACHE_FILE, "{}") } catch {}
+      return {}
+    }
+    return parsed
+  } catch (err) {
+    // Corrupt JSON — delete so we can recover on next successful fetch.
+    try { writeFileSync(CACHE_FILE, "{}") } catch {}
+    return {}
+  }
 }
 function saveCache(cache) {
   try { writeFileSync(CACHE_FILE, JSON.stringify(cache)) } catch {}
@@ -222,7 +234,7 @@ async function runFirstTimeSetup(logFn) {
     await runPS(setupScript, ["-Quick", "-Patch"], { timeout: 120_000 })
     logFn("info", "first-time setup complete")
   } catch (err) {
-    logFn("error", "first-time setup failed", { error: err?.message })
+    logFn("error", "first-time setup failed", { error: err?.message ?? err })
   }
 }
 
@@ -271,7 +283,7 @@ async function ensureSidecarRunning(logFn) {
     logFn("warn", `CLI server not listening after 15s on port ${DEFAULT_PORT}`)
     return { launched: false, pid: child.pid }
   } catch (err) {
-    logFn("error", "failed to launch CLI server", { error: err?.message })
+    logFn("error", "failed to launch CLI server", { error: err?.message ?? err })
     return { launched: false, pid: null }
   }
 }
@@ -298,7 +310,7 @@ function startWatcher(logFn) {
     logFn("info", `watcher started (PID ${child.pid})`)
     return child
   } catch (err) {
-    logFn("error", "failed to start watcher", { error: err?.message })
+    logFn("error", "failed to start watcher", { error: err?.message ?? err })
     return null
   }
 }
@@ -398,7 +410,7 @@ async function checkForUpdates(logFn, osNotify) {
             // File may be locked (still loaded by host). Log and abort update —
             // overwriting without a backup would brick the plugin permanently.
             logFn("warn", "could not back up plugin file, skipping update", {
-              error: renameErr?.message,
+              error: renameErr?.message ?? renameErr,
               hint: "plugin may be loaded by host; restart and retry",
             })
             return
@@ -417,13 +429,15 @@ async function checkForUpdates(logFn, osNotify) {
         }
 
         logFn("info", `self-updated to ${remoteVersion}. Restart OpenCode to load.`)
+        // .catch guards against unhandled rejection in the fire-and-forget toast.
         osNotify("mobile-sync Updated", `Updated to v${remoteVersion}. Restart OpenCode to apply.`)
+          .catch((err) => logFn("debug", "update toast failed", { error: err?.message ?? err }))
       }
     } finally {
       await rm(tempDir, { recursive: true, force: true }).catch(() => {})
     }
   } catch (err) {
-    logFn("debug", "update check skipped", { error: err?.message })
+    logFn("debug", "update check skipped", { error: err?.message ?? err })
   }
 }
 
@@ -471,6 +485,8 @@ const MobileSyncPlugin = async ({ $ }) => {
   const osNotify = createOsNotifier({ $ })
 
   const TAG = "[mobile-sync]"
+  /** Normalize any thrown value into a string for logging. Handles Error objects, strings, and unknowns. */
+  const errStr = (err) => err?.message ?? (typeof err === "string" ? err : JSON.stringify(err))
   const logFn = (level, msg, extra) => {
     const line = `${TAG} ${msg}`
     const fn = level === "error" ? "error"
@@ -496,7 +512,7 @@ const MobileSyncPlugin = async ({ $ }) => {
     if (Date.now() - lastUpdateCheckAt < UPDATE_CHECK_INTERVAL_MS) return
     lastUpdateCheckAt = Date.now()
     checkForUpdates(logFn, osNotify).catch((err) => {
-      logFn("debug", "periodic update check failed", { error: err?.message })
+      logFn("debug", "periodic update check failed", { error: errStr(err) })
     })
   }, UPDATE_CHECK_INTERVAL_MS)
   if (updateTimer.unref) updateTimer.unref()
@@ -530,11 +546,11 @@ const MobileSyncPlugin = async ({ $ }) => {
       startupToastTimer = setTimeout(() => {
         startupToastTimer = null
         osNotify("mobile-sync Ready", `v${MOBILE_SYNC_VERSION} active on port ${port}`)
-          .catch((err) => logFn("debug", "startup toast failed", { error: err?.message }))
+          .catch((err) => logFn("debug", "startup toast failed", { error: errStr(err) }))
       }, 5_000)
       if (startupToastTimer?.unref) startupToastTimer.unref()
     } catch (err) {
-      logFn("error", "deferred init failed", { error: err?.message })
+      logFn("error", "deferred init failed", { error: errStr(err) })
     }
   })()
 
@@ -598,7 +614,7 @@ const MobileSyncPlugin = async ({ $ }) => {
           }
         }
       } catch (err) {
-        logFn("debug", "event handler error", { error: err?.message })
+        logFn("debug", "event handler error", { error: errStr(err) })
       }
     },
 

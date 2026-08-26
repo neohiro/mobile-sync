@@ -153,14 +153,30 @@ if ($Register) {
     exit 0
 }
 
-# --- Default: show this device's connection ---
-$hostname = Get-TailscaleHostname
-$dnsName = Get-TailscaleDnsName
-$deviceName = Get-DeviceName
+# --- Load password for both directory detection and display ---
 $password = ''
 if (Test-Path -LiteralPath $passwordFile) {
     $password = (Get-Content -LiteralPath $passwordFile -Raw).Trim()
 }
+
+# --- Detect server's current directory ---
+# Query the running server for its active directory (from /api/provider).
+# The CLI server defaults to the directory it was started from (global project).
+# The mobile app needs this to filter sessions to the right project.
+$serverDir = $null
+if ($password) {
+    try {
+        $basicAuth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("opencode:$password"))
+        $headers = @{ "Authorization" = "Basic $basicAuth" }
+        $resp = Invoke-RestMethod -Uri "http://127.0.0.1:4096/api/provider" -Headers $headers -TimeoutSec 3
+        $serverDir = $resp.location.directory
+    } catch { }
+}
+
+# --- Default: show this device's connection ---
+$hostname = Get-TailscaleHostname
+$dnsName = Get-TailscaleDnsName
+$deviceName = Get-DeviceName
 
 if (-not $hostname) {
     Write-Host ""
@@ -181,12 +197,21 @@ if ($password) {
 } else {
     Write-Host "  Password: (not configured - run setup first)" -ForegroundColor Yellow
 }
+if ($serverDir) {
+    Write-Host "  Directory: $serverDir" -ForegroundColor Cyan
+} else {
+    Write-Host "  Directory: (server not running or unreachable)" -ForegroundColor Yellow
+}
 Write-Host ""
 
 if ($QR) {
     Write-Host "QR-code-friendly (copy into QR generator):" -ForegroundColor Gray
     Write-Host ""
-    Write-Host "opencode|$url|opencode|$password" -ForegroundColor White
+    if ($serverDir) {
+        Write-Host "opencode|$url|opencode|$password|$serverDir" -ForegroundColor White
+    } else {
+        Write-Host "opencode|$url|opencode|$password" -ForegroundColor White
+    }
     Write-Host ""
 }
 

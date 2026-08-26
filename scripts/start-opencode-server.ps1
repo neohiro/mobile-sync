@@ -18,6 +18,13 @@ $ErrorActionPreference = 'Stop'
 $port = 4096
 $bindHost = '127.0.0.1'
 $passwordFile = "$env:USERPROFILE\.opencode-server-password"
+$directoryFile = "$env:USERPROFILE\.opencode-server-directory"
+
+# --- Save the directory this server is being started from ---
+# The CLI server has no --directory flag, so the mobile app needs to know
+# the working directory to filter sessions to the right project.
+$currentDir = (Get-Location).Path
+[System.IO.File]::WriteAllText($directoryFile, $currentDir)
 
 # --- Load saved funnel URL or detect from Tailscale ---
 $funnelConfigFile = "$env:USERPROFILE\.opencode-funnel-url"
