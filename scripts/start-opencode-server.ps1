@@ -100,11 +100,9 @@ Write-Host "is the primary server on port 4096." -ForegroundColor DarkGray
 Write-Host "  Ctrl+C to stop" -ForegroundColor Gray
 Write-Host ""
 
-$corsArg = if ($funnelUrl) { $funnelUrl } else { "" }
-
 if ($Detached) {
     $serveArgs = @("serve", "--hostname", $bindHost, "--port", $port)
-    if ($corsArg) { $serveArgs += @("--cors", $corsArg) }
+    if ($funnelUrl) { $serveArgs += "--cors=$funnelUrl" }
     $proc = Start-Process -FilePath $exe -ArgumentList $serveArgs `
         -WindowStyle Hidden -PassThru
     Write-Host "Server started (PID $($proc.Id)). Waiting for port $port..." -ForegroundColor Green
@@ -122,8 +120,8 @@ if ($Detached) {
         Write-Host "  WARNING: Port $port not yet listening after 10s. Server may still be starting." -ForegroundColor Yellow
     }
 } else {
-    if ($corsArg) {
-        & $exe serve --hostname $bindHost --port $port --cors "$corsArg"
+    if ($funnelUrl) {
+        & $exe serve --hostname $bindHost --port $port --cors=$funnelUrl
     } else {
         & $exe serve --hostname $bindHost --port $port
     }

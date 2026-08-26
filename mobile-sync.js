@@ -20,7 +20,7 @@ import { readFileSync, existsSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { homedir, platform, tmpdir } from "node:os"
 
-const MOBILE_SYNC_VERSION = "1.0.1"
+const MOBILE_SYNC_VERSION = "1.0.2"
 const GITHUB_REPO = "neohiro/mobile-sync"
 const UPDATE_CHECK_INTERVAL_MS = 3_600_000 // hourly
 const DEFAULT_PORT = 4096
@@ -313,61 +313,63 @@ async function checkForUpdates(logFn, osNotify) {
     if (!zipRes.ok) return
     const zipBytes = Buffer.from(await zipRes.arrayBuffer())
 
-    // Write zip to temp, extract, replace
+    // Write zip to temp, extract, replace. Use try/finally for temp cleanup
+    // so partial failures don't leak files in tmpdir.
     const tempDir = join(tmpdir(), `mobile-sync-update-${Date.now()}`)
-    const zipPath = join(tempDir, "update.zip")
     await mkdir(tempDir, { recursive: true })
-    await writeFile(zipPath, zipBytes)
+    try {
+      const zipPath = join(tempDir, "update.zip")
+      await writeFile(zipPath, zipBytes)
 
-    // Extract with PowerShell
-    if (isWindows) {
-      const extractDir = join(tempDir, "extracted")
-      // Use runPSCommand for inline -Command (not runPS which uses -File)
-      await runPSCommand(
-        `Expand-Archive -Path '${zipPath}' -DestinationPath '${extractDir}' -Force`,
-        { timeout: 30_000 }
-      )
+      if (isWindows) {
+        const extractDir = join(tempDir, "extracted")
+        // Use runPSCommand for inline -Command (not runPS which uses -File)
+        await runPSCommand(
+          `Expand-Archive -Path '${zipPath}' -DestinationPath '${extractDir}' -Force`,
+          { timeout: 30_000 }
+        )
 
-      // Find the extracted folder (GitHub zip contains a single folder)
-      const entries = await readdir(extractDir)
-      if (entries.length === 0) return
-      const srcDir = join(extractDir, entries[0])
+        // Find the extracted folder (GitHub zip contains a single folder)
+        const entries = await readdir(extractDir)
+        if (entries.length === 0) return
+        const srcDir = join(extractDir, entries[0])
 
-      // Copy scripts/ if present
-      const scriptsSrc = join(srcDir, "scripts")
-      if (existsSync(scriptsSrc)) {
-        const scriptsDest = scriptsDir
-        await rm(scriptsDest, { recursive: true, force: true })
-        await copyDir(scriptsSrc, scriptsDest)
-      }
-
-      // Copy updated plugin file (with rollback on failure)
-      const pluginSrc = join(srcDir, "mobile-sync.js")
-      if (existsSync(pluginSrc)) {
-        const pluginDest = join(pluginDir, "mobile-sync.js")
-        const backup = `${pluginDest}.bak`
-        await rename(pluginDest, backup).catch(() => {})
-        try {
-          await copyFile(pluginSrc, pluginDest)
-        } catch (copyErr) {
-          // Rollback: restore .bak as current so plugin isn't bricked
-          await rename(backup, pluginDest).catch(() => {})
-          throw copyErr
+        // Copy scripts/ if present
+        const scriptsSrc = join(srcDir, "scripts")
+        if (existsSync(scriptsSrc)) {
+          const scriptsDest = scriptsDir
+          await rm(scriptsDest, { recursive: true, force: true })
+          await copyDir(scriptsSrc, scriptsDest)
         }
-      }
 
-      // Copy package.json if present
-      const pkgSrc = join(srcDir, "package.json")
-      if (existsSync(pkgSrc)) {
-        await copyFile(pkgSrc, join(pluginDir, "package.json"))
-      }
+        // Copy updated plugin file (with rollback on failure)
+        const pluginSrc = join(srcDir, "mobile-sync.js")
+        if (existsSync(pluginSrc)) {
+          const pluginDest = join(pluginDir, "mobile-sync.js")
+          const backup = `${pluginDest}.bak`
+          await rename(pluginDest, backup).catch(() => {})
+          try {
+            await copyFile(pluginSrc, pluginDest)
+          } catch (copyErr) {
+            // Rollback: restore .bak as current so plugin isn't bricked
+            await rename(backup, pluginDest).catch(() => {})
+            throw copyErr
+          }
+        }
 
-      logFn("info", `self-updated to ${remoteVersion}. Restart OpenCode to load.`)
-      osNotify("mobile-sync Updated", `Updated to v${remoteVersion}. Restart OpenCode to apply.`)
+        // Copy package.json if present
+        const pkgSrc = join(srcDir, "package.json")
+        if (existsSync(pkgSrc)) {
+          await copyFile(pkgSrc, join(pluginDir, "package.json"))
+        }
+
+        logFn("info", `self-updated to ${remoteVersion}. Restart OpenCode to load.`)
+        osNotify("mobile-sync Updated", `Updated to v${remoteVersion}. Restart OpenCode to apply.`)
+      }
+    } finally {
+      // Cleanup temp (always, even on failure)
+      await rm(tempDir, { recursive: true, force: true }).catch(() => {})
     }
-
-    // Cleanup temp
-    await rm(tempDir, { recursive: true, force: true }).catch(() => {})
   } catch (err) {
     logFn("debug", "update check skipped", { error: err?.message })
   }
@@ -463,9 +465,10 @@ const MobileSyncPlugin = async ({ client, $ }) => {
       logFn("info", `initialized (port ${port})`)
 
       // Delayed startup toast — shows after GUI has loaded (5s)
-      setTimeout(() => {
+      const startupToast = setTimeout(() => {
         osNotify("mobile-sync Ready", `v${MOBILE_SYNC_VERSION} active on port ${port}`)
       }, 5_000)
+      if (startupToast.unref) startupToast.unref()
     } catch (err) {
       logFn("error", "deferred init failed", { error: err?.message })
     }
@@ -519,10 +522,14 @@ const MobileSyncPlugin = async ({ client, $ }) => {
         try { watcherProc.kill() } catch {}
         watcherProc = null
       }
-      // Kill the PowerShell launcher wrapper only — the desktop/electron
-      // sidecar runs independently and is NOT our child process.
       if (launcherPid) {
-        try { process.kill(launcherPid, "SIGTERM") } catch {}
+        try {
+          if (isWindows) {
+            execFile("taskkill", ["/F", "/PID", String(launcherPid)], { windowsHide: true }, () => {})
+          } else {
+            process.kill(launcherPid, "SIGTERM")
+          }
+        } catch {}
         launcherPid = null
       }
       logFn("info", "disposed")
