@@ -315,8 +315,9 @@ async function checkForUpdates(logFn, osNotify) {
       accept: "application/vnd.github.v3+json",
     }
     // Validate ETag before sending as header — guards against malformed cache
-    // file. ETags from GitHub are quoted strings like W/"abc..." or "abc...".
-    if (typeof cache.etag === "string" && /^[\w"-]{8,128}$/.test(cache.etag)) {
+    // file. GitHub ETags are weak (`W/"hex"`) or strong (`"hex"`) with a 64-char
+    // hex digest. Allowed chars: word chars, slash, dash, quote; 16-80 length.
+    if (typeof cache.etag === "string" && /^[\w"/-]{16,80}$/.test(cache.etag)) {
       headers["if-none-match"] = cache.etag
     }
 
