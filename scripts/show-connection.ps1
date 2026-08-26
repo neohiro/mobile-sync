@@ -1,0 +1,220 @@
+# show-connection.ps1
+# Shows this device's connection details for the OpenCode mobile app.
+# Each device (server) has its own Tailscale hostname - the mobile app
+# connects to a specific device via its Funnel URL.
+#
+# Usage:
+#   .\show-connection.ps1              # Show connection details
+#   .\show-connection.ps1 -AllDevices  # Show all devices from registry
+#   .\show-connection.ps1 -Register    # Register this device in shared registry
+#   .\show-connection.ps1 -QR          # Output QR-code-friendly plain text
+
+param(
+    [switch]$AllDevices,
+    [switch]$Register,
+    [switch]$QR
+)
+
+$ErrorActionPreference = 'Stop'
+
+$passwordFile = "$env:USERPROFILE\.opencode-server-password"
+$deviceRegistry = "$env:USERPROFILE\.opencode-devices.json"
+
+# --- Detect this device's Tailscale hostname ---
+function Get-TailscaleHostname {
+    $tsPath = "C:\Program Files\Tailscale\tailscale.exe"
+    if (-not (Test-Path $tsPath)) { return $null }
+    try {
+        $tsJson = & $tsPath status --json 2>&1
+        if ($LASTEXITCODE -ne 0) { return $null }
+        $tsSelf = ($tsJson | ConvertFrom-Json).Self
+        if ($tsSelf) { return $tsSelf.HostName }
+    } catch { }
+    return $null
+}
+
+# --- Detect this device's Tailscale full DNS name (for Funnel URL) ---
+function Get-TailscaleDnsName {
+    $tsPath = "C:\Program Files\Tailscale\tailscale.exe"
+    if (-not (Test-Path $tsPath)) { return $null }
+    try {
+        $tsJson = & $tsPath status --json 2>&1
+        if ($LASTEXITCODE -ne 0) { return $null }
+        $tsSelf = ($tsJson | ConvertFrom-Json).Self
+        if ($tsSelf) { return $tsSelf.DNSName.TrimEnd('.') }
+    } catch { }
+    return $null
+}
+
+# --- Detect this device's name ---
+function Get-DeviceName {
+    # Try saved name first
+    $nameFile = "$env:USERPROFILE\.opencode-device-name"
+    if (Test-Path -LiteralPath $nameFile) {
+        return (Get-Content -LiteralPath $nameFile -Raw).Trim()
+    }
+    # Fall back to Tailscale hostname or computer name
+    $hostname = Get-TailscaleHostname
+    if ($hostname) { return $hostname }
+    return $env:COMPUTERNAME
+}
+
+# --- Show all registered devices ---
+if ($AllDevices) {
+    Write-Host ""
+    Write-Host "Registered OpenCode Devices" -ForegroundColor Cyan
+    Write-Host "===========================" -ForegroundColor Cyan
+
+    if (-not (Test-Path -LiteralPath $deviceRegistry)) {
+        Write-Host "No devices registered. Run .\show-connection.ps1 -Register on each device." -ForegroundColor Yellow
+        exit 0
+    }
+
+    $devices = Get-Content -LiteralPath $deviceRegistry -Raw | ConvertFrom-Json
+    if ($devices.Count -eq 0) {
+        Write-Host "No devices registered." -ForegroundColor Yellow
+        exit 0
+    }
+
+    foreach ($device in $devices) {
+        $lastSeen = if ($device.LastSeen) { $device.LastSeen } else { "unknown" }
+        Write-Host ""
+        Write-Host "  $($device.Name)" -ForegroundColor Green
+        Write-Host "    URL:      $($device.URL)" -ForegroundColor Gray
+        Write-Host "    User:     opencode" -ForegroundColor Gray
+        Write-Host "    Password: $('*' * ([math]::Max(0, $device.Password.Length - 4)))" -ForegroundColor Gray
+        Write-Host "    Last seen: $lastSeen" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+    exit 0
+}
+
+# --- Register this device ---
+if ($Register) {
+    $hostname = Get-TailscaleHostname
+    if (-not $hostname) {
+        throw "Tailscale not found or not logged in. Cannot register device."
+    }
+    $dnsName = Get-TailscaleDnsName
+    $deviceName = Get-DeviceName
+    $password = ''
+    if (Test-Path -LiteralPath $passwordFile) {
+        $password = (Get-Content -LiteralPath $passwordFile -Raw).Trim()
+    }
+    if (-not $password) {
+        throw "Password file not found: $passwordFile`nRun setup first: .\setup-opencode-shared.ps1"
+    }
+
+    $url = if ($dnsName) { "https://$dnsName" } else { "https://$hostname" }
+    $entry = [PSCustomObject]@{
+        Name     = $deviceName
+        URL      = $url
+        Hostname = $hostname
+        DNSName  = $dnsName
+        Password = $password
+        LastSeen = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    }
+
+    # Load existing registry or create new
+    $devices = @()
+    if (Test-Path -LiteralPath $deviceRegistry) {
+        try {
+            $devices = @(Get-Content -LiteralPath $deviceRegistry -Raw | ConvertFrom-Json)
+        } catch {
+            $devices = @()
+        }
+    }
+
+    # Update existing entry or add new
+    $existing = $devices | Where-Object { $_.Hostname -eq $hostname }
+    if ($existing) {
+        $devices = $devices | ForEach-Object {
+            if ($_.Hostname -eq $hostname) {
+                $entry
+            } else {
+                $_
+            }
+        }
+        Write-Host "Updated device: $deviceName ($url)" -ForegroundColor Green
+    } else {
+        $devices += $entry
+        Write-Host "Registered device: $deviceName ($url)" -ForegroundColor Green
+    }
+
+    # Save registry
+    $devices | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $deviceRegistry -Encoding UTF8
+    Write-Host "Registry saved to: $deviceRegistry" -ForegroundColor Gray
+    exit 0
+}
+
+# --- Default: show this device's connection ---
+$hostname = Get-TailscaleHostname
+$dnsName = Get-TailscaleDnsName
+$deviceName = Get-DeviceName
+$password = ''
+if (Test-Path -LiteralPath $passwordFile) {
+    $password = (Get-Content -LiteralPath $passwordFile -Raw).Trim()
+}
+
+if (-not $hostname) {
+    Write-Host ""
+    Write-Host "Tailscale not detected. Showing local-only info." -ForegroundColor Yellow
+    $url = "http://127.0.0.1:4096"
+} else {
+    $url = if ($dnsName) { "https://$dnsName" } else { "https://$hostname" }
+}
+
+Write-Host ""
+Write-Host "OpenCode Mobile Connection - $deviceName" -ForegroundColor Cyan
+Write-Host "==========================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "  URL:      $url" -ForegroundColor White
+Write-Host "  User:     opencode" -ForegroundColor White
+if ($password) {
+    Write-Host "  Password: $password" -ForegroundColor White
+} else {
+    Write-Host "  Password: (not configured - run setup first)" -ForegroundColor Yellow
+}
+Write-Host ""
+
+if ($QR) {
+    Write-Host "QR-code-friendly (copy into QR generator):" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "opencode|$url|opencode|$password" -ForegroundColor White
+    Write-Host ""
+}
+
+if ($hostname) {
+    # Check if this device is registered
+    $registered = $false
+    if (Test-Path -LiteralPath $deviceRegistry) {
+        try {
+            $devices = @(Get-Content -LiteralPath $deviceRegistry -Raw | ConvertFrom-Json)
+            $registered = ($devices | Where-Object { $_.Hostname -eq $hostname }) -ne $null
+        } catch { }
+    }
+
+    if (-not $registered) {
+        Write-Host "This device is not registered. To track all your devices:" -ForegroundColor Gray
+        Write-Host "  .\show-connection.ps1 -Register" -ForegroundColor Gray
+        Write-Host "  .\show-connection.ps1 -AllDevices" -ForegroundColor Gray
+    }
+
+    # Check funnel status
+    $tsPath = "C:\Program Files\Tailscale\tailscale.exe"
+    if (Test-Path $tsPath) {
+        $funnelStatus = & $tsPath funnel status 2>&1
+        if ($funnelStatus -match "4096") {
+            Write-Host ""
+            Write-Host "  Funnel: ACTIVE ($url -> 127.0.0.1:4096)" -ForegroundColor Green
+        } else {
+            Write-Host ""
+            Write-Host "  Funnel: NOT CONFIGURED" -ForegroundColor Yellow
+            Write-Host "  Run: tailscale funnel 4096" -ForegroundColor Yellow
+        }
+    }
+} else {
+    Write-Host "Mobile app will only work on the local network." -ForegroundColor Yellow
+    Write-Host "Install Tailscale for remote access: https://tailscale.com/download" -ForegroundColor Yellow
+}
+Write-Host ""
