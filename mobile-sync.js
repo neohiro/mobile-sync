@@ -1,5 +1,5 @@
 /**
- * mobile-sync — OpenCode plugin
+ * mobile-sync ΓÇö OpenCode plugin
  *
  * Makes the desktop sidecar (or CLI server as fallback) act as a shared server
  * on port 4096, accessible via Tailscale Funnel for mobile sync.
@@ -37,7 +37,7 @@ const UPDATE_CHECK_INTERVAL_MS = 3_600_000 // hourly
 const DEFAULT_PORT = 4096
 const GITHUB_API_BASE = "https://api.github.com"
 
-// ── ETag cache for GitHub release polling (avoids 60/hr rate limit) ─────────
+// ΓöÇΓöÇ ETag cache for GitHub release polling (avoids 60/hr rate limit) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 // Writes are serialized via a module-scope promise chain so concurrent
 // checkForUpdates() calls (e.g. one-shot init + hourly interval) can't
 // interleave JSON on Windows (which lacks atomic append).
@@ -69,7 +69,7 @@ function saveCache(cache) {
   return next
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ΓöÇΓöÇ Helpers ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 const isWindows = platform() === "win32"
 
@@ -112,7 +112,7 @@ const errStr = (err) => {
   }
 }
 
-// ── OS notifications (same mechanism as auto-resume) ────────────────────────
+// ΓöÇΓöÇ OS notifications (same mechanism as auto-resume) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 const psQuote = (s) => "'" + String(s).replace(/'/g, "''") + "'"
 
@@ -191,11 +191,11 @@ const scriptsDir = pluginDir ? join(pluginDir, "mobile-sync-scripts") : null
  * password, persist it, and return it. The user is shown this password once
  * in the startup log so they can configure their mobile app.
  * Empty, BOM-only, or corrupted files are regenerated (self-healing).
- * NEVER falls back to a hardcoded value — every install gets a unique secret.
+ * NEVER falls back to a hardcoded value ΓÇö every install gets a unique secret.
  *
  * Thread-safety: writes use a temp file + atomic rename so concurrent calls
  * from multiple processes produce a consistent file (last writer wins, but
- * no partial-file corruption). File mode 0o600 — world-inaccessible on POSIX;
+ * no partial-file corruption). File mode 0o600 ΓÇö world-inaccessible on POSIX;
  * Windows enforces per-user ACLs regardless.
  */
 function readPassword() {
@@ -267,9 +267,9 @@ function runPSCommand(command, opts = {}) {
 
 /**
  * Check if a TCP port is listening on localhost (IPv4 only).
- * Pure Node — no PowerShell overhead (8ms vs ~500ms).
+ * Pure Node ΓÇö no PowerShell overhead (8ms vs ~500ms).
  * family: 4 is intentional: the opencode sidecar/CLI binds to 127.0.0.1.
- * If a future version binds to IPv6 (::1), this will false-negative —
+ * If a future version binds to IPv6 (::1), this will false-negative ΓÇö
  * update family to 0 (dual-stack) and host to "localhost".
  */
 function isPortListening(port) {
@@ -300,7 +300,7 @@ function isNewer(remote, local) {
   return false
 }
 
-// ── First-time setup ───────────────────────────────────────────────────────
+// ΓöÇΓöÇ First-time setup ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 async function runFirstTimeSetup(logFn) {
   if (!isWindows || !scriptsDir) return
@@ -326,7 +326,7 @@ async function runFirstTimeSetup(logFn) {
   }
 }
 
-// ── Launch sidecar ─────────────────────────────────────────────────────────
+// ΓöÇΓöÇ Launch sidecar ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 async function ensureSidecarRunning(logFn) {
   if (!isWindows || !scriptsDir) return { launched: false, pid: null }
@@ -352,7 +352,7 @@ async function ensureSidecarRunning(logFn) {
   logFn("info", "launching CLI server (desktop not running)...")
   try {
     // Launch detached (non-blocking). Node's detached: true handles process
-    // survival — do NOT also pass -Detached to the script (conflicts).
+    // survival ΓÇö do NOT also pass -Detached to the script (conflicts).
     const child = spawn(PS_EXE, [...PS_FLAGS, "-File", launcher, "-Detached"], {
       windowsHide: true,
       detached: true,
@@ -376,7 +376,7 @@ async function ensureSidecarRunning(logFn) {
   }
 }
 
-// ── Start auto-repatch watcher ─────────────────────────────────────────────
+// ΓöÇΓöÇ Start auto-repatch watcher ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 function startWatcher(logFn) {
   if (!isWindows || !scriptsDir) return null
@@ -403,18 +403,36 @@ function startWatcher(logFn) {
   }
 }
 
-// ── Auto-updater ───────────────────────────────────────────────────────────
+// ΓöÇΓöÇ Auto-updater ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+// Serialize concurrent checkForUpdates() calls so only one runs at a time.
+// The in-flight promise is awaited by subsequent callers instead of starting
+// duplicate fetches/downloads.
+let _updateInFlight = null
 
 async function checkForUpdates(logFn, osNotify) {
   if (!pluginDir || !scriptsDir) return
 
+  // If an update check is already running, wait for its result instead of
+  // starting a second concurrent fetch (which would double bandwidth and race writes).
+  if (_updateInFlight) {
+    try { await _updateInFlight } catch {}
+    return
+  }
+
+  const work = _runUpdate(logFn, osNotify)
+  _updateInFlight = work
+  try { await work } finally { _updateInFlight = null }
+}
+
+async function _runUpdate(logFn, osNotify) {
   try {
     const cache = loadCache()
     const headers = {
       "user-agent": `mobile-sync-plugin/${MOBILE_SYNC_VERSION}`,
       accept: "application/vnd.github.v3+json",
     }
-    // Validate ETag before sending as header — guards against malformed cache
+    // Validate ETag before sending as header ΓÇö guards against malformed cache
     // file. GitHub ETags are weak (`W/"hex"`) or strong (`"hex"`) with a 64-char
     // hex digest. Allowed chars: word chars, slash, dash, quote; 16-80 length.
     if (typeof cache.etag === "string" && /^[\w"/-]{16,80}$/.test(cache.etag)) {
@@ -488,7 +506,7 @@ async function checkForUpdates(logFn, osNotify) {
           // Windows if a running PowerShell process (e.g. the CLI server) has one
           // of the scripts open with an exclusive lock. In that case we fall back
           // to a per-file copy (files that were removed in the new release will
-          // persist as orphans — acceptable; new/updated files are still deployed).
+          // persist as orphans ΓÇö acceptable; new/updated files are still deployed).
           try {
             await rm(scriptsDest, { recursive: true, force: true })
           } catch (rmErr) {
@@ -504,7 +522,7 @@ async function checkForUpdates(logFn, osNotify) {
           try {
             await rename(pluginDest, backup)
           } catch (renameErr) {
-            // File may be locked (still loaded by host). Log and abort update —
+            // File may be locked (still loaded by host). Log and abort update ΓÇö
             // overwriting without a backup would brick the plugin permanently.
             logFn("warn", "could not back up plugin file, skipping update", {
               error: errStr(renameErr),
@@ -519,7 +537,7 @@ async function checkForUpdates(logFn, osNotify) {
             await rename(backup, pluginDest).catch(() => {})
             throw copyErr
           }
-          // Successful update — remove the backup to avoid accumulating
+          // Successful update ΓÇö remove the backup to avoid accumulating
           // stale .bak files across many updates.
           await rm(backup, { force: true }).catch(() => {})
         }
@@ -572,7 +590,7 @@ async function copyFile(src, dest) {
   await writeFile(dest, data)
 }
 
-// ── Plugin Export ───────────────────────────────────────────────────────────
+// ΓöÇΓöÇ Plugin Export ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 const MobileSyncPlugin = async ({ $ }) => {
   // Allow disabling via env var (0/false/off = disabled)
@@ -608,7 +626,7 @@ const MobileSyncPlugin = async ({ $ }) => {
   const osNotify = createOsNotifier({ $ })
 
   // Mask password: show last 4 chars so the user can still identify it.
-  // Show the full value ONCE at startup — this is the only time the user
+  // Show the full value ONCE at startup ΓÇö this is the only time the user
   // will see it. They must copy it into the Android app's connection config.
   const maskedPw = password
     ? (password.length <= 4 ? "*".repeat(password.length) : "*".repeat(password.length - 4) + password.slice(-4))
@@ -627,7 +645,53 @@ const MobileSyncPlugin = async ({ $ }) => {
   }, UPDATE_CHECK_INTERVAL_MS)
   if (updateTimer.unref) updateTimer.unref()
 
-  // ── Deferred init: run heavy work AFTER returning hooks ──
+  // ── Watchdog: keep the CLI server alive ────────────────────────────────
+  // The scheduled task provides the first boot, but once the plugin is
+  // loaded it becomes the primary watchdog: every 30s we confirm the port
+  // is listening and the opencode.exe process exists. If the port is down
+  // we try to relaunch via the script. Cooldown gates the rate of restarts
+  // so we don't spam in a tight loop.
+  let watchdogTimer = null
+  const WATCHDOG_INTERVAL_MS = 30_000
+  let lastWatchdogAt = 0
+  let watchdogStarting = false  // re-entrancy guard for the watchdog itself
+  const ensureServerHealthy = async () => {
+    if (watchdogStarting) return
+    if (Date.now() - lastWatchdogAt < WATCHDOG_INTERVAL_MS - 1_000) return
+    lastWatchdogAt = Date.now()
+    if (await isPortListening(port)) {
+      portWasDown = false
+      return
+    }
+    if (Date.now() - lastRelaunchAt < RELAUNCH_COOLDOWN_MS) return
+    watchdogStarting = true
+    lastRelaunchAt = Date.now()
+    portWasDown = true
+    try {
+      logFn("warn", "watchdog: port down, restarting server")
+      const result = await ensureSidecarRunning(logFn)
+      if (result.pid) launcherPid = result.pid
+      if (await isPortListening(port)) {
+        portWasDown = false
+        logFn("info", "watchdog: server recovered")
+      }
+    } catch (err) {
+      logFn("debug", "watchdog restart failed", { error: errStr(err) })
+    } finally {
+      watchdogStarting = false
+    }
+  }
+  // Only enable the watchdog on Windows where the CLI server runs.
+  if (isWindows) {
+    watchdogTimer = setInterval(() => {
+      ensureServerHealthy().catch((err) =>
+        logFn("debug", "watchdog tick failed", { error: errStr(err) })
+      )
+    }, WATCHDOG_INTERVAL_MS)
+    if (watchdogTimer.unref) watchdogTimer.unref()
+  }
+
+  // ΓöÇΓöÇ Deferred init: run heavy work AFTER returning hooks ΓöÇΓöÇ
   // This prevents the plugin from blocking OpenCode's GUI startup.
   // All errors are caught so a failure here never bricks the client.
   (async () => {
@@ -650,7 +714,7 @@ const MobileSyncPlugin = async ({ $ }) => {
 
       logFn("info", `initialized (port ${port})`)
 
-      // Delayed startup toast — shows after GUI has loaded (5s).
+      // Delayed startup toast ΓÇö shows after GUI has loaded (5s).
       // Tracked so dispose can cancel it if plugin unloads before it fires.
       // .catch guards against unhandled rejection in the fire-and-forget timer.
       startupToastTimer = setTimeout(() => {
@@ -664,13 +728,13 @@ const MobileSyncPlugin = async ({ $ }) => {
     }
   })()
 
-  // ── Hooks (returned immediately, never blocks) ──
+  // ΓöÇΓöÇ Hooks (returned immediately, never blocks) ΓöÇΓöÇ
   return {
     // Inject OPENCODE_PORT + OPENCODE_SERVER_PASSWORD into shell command env.
     // SECURITY: the password is injected as plain text into EVERY shell command
     // run by OpenCode (not just opencode-related ones). This means `env`, error
     // messages, and any process the shell spawns can see it. The auth scheme
-    // is HTTP Basic — these env vars are equivalent to bearer tokens.
+    // is HTTP Basic ΓÇö these env vars are equivalent to bearer tokens.
     //
     // This is by design: the user explicitly set up the shared server, and
     // injecting the env avoids re-typing the password for every curl/wget
@@ -700,9 +764,14 @@ const MobileSyncPlugin = async ({ $ }) => {
 
         if (event.type === "session.idle") {
           if (!isWindows || relaunching) return
+          // If we just attempted a relaunch, give the new process a few
+          // seconds to bind the port before probing again. The watchdog
+          // (running every 30s) handles the long-term recovery; this hook
+          // is just a fast-path for when OpenCode goes idle soon after a crash.
+          if (portWasDown && (Date.now() - lastRelaunchAt) < 10_000) return
           const portOpen = await isPortListening(port)
           if (portOpen) {
-            // Port is back — clear the down flag so the next outage triggers fast recovery
+            // Port is back ΓÇö clear the down flag so the next outage triggers fast recovery
             portWasDown = false
             return
           }
@@ -738,6 +807,10 @@ const MobileSyncPlugin = async ({ $ }) => {
         clearInterval(updateTimer)
         updateTimer = null
       }
+      if (watchdogTimer) {
+        clearInterval(watchdogTimer)
+        watchdogTimer = null
+      }
       if (startupToastTimer) {
         clearTimeout(startupToastTimer)
         startupToastTimer = null
@@ -752,7 +825,7 @@ const MobileSyncPlugin = async ({ $ }) => {
       if (launcherPid) {
         const tree = process.env.MOBILE_SYNC_KILL_SERVER_ON_DISPOSE === "1"
         if (isWindows && tree) {
-          // /T = terminate child tree, /F = force. Ignore exit code — the
+          // /T = terminate child tree, /F = force. Ignore exit code ΓÇö the
           // wrapper may have already exited and taskkill returns non-zero
           // in that case, which is fine.
           execFile("taskkill", ["/T", "/F", "/PID", String(launcherPid)], { windowsHide: true }, () => {})
