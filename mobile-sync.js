@@ -560,12 +560,20 @@ async function _runUpdate(logFn, osNotify) {
             await copyFile(pluginSrc, pluginDest)
           } catch (copyErr) {
             // Restore the previous version so the next load still works.
-            await rename(backup, pluginDest).catch(() => {})
+            await rename(backup, pluginDest).catch((restoreErr) => {
+              logFn("error", "could not restore plugin backup after failed copy", {
+                error: errStr(restoreErr),
+                hint: "plugin may be in inconsistent state; check $backup file",
+              })
+            })
             throw copyErr
           }
-          // Successful update ΓÇö remove the backup to avoid accumulating
-          // stale .bak files across many updates.
-          await rm(backup, { force: true }).catch(() => {})
+          // Successful update — remove the backup to avoid accumulating
+          // stale .bak files across many updates. Log if cleanup fails so the
+          // user can manually clean up rather than wondering why a .bak persists.
+          await rm(backup, { force: true }).catch((rmErr) => {
+            logFn("debug", "could not remove plugin backup file", { error: errStr(rmErr) })
+          })
         }
 
         const pkgSrc = join(srcDir, "package.json")
@@ -579,7 +587,10 @@ async function _runUpdate(logFn, osNotify) {
           .catch((err) => logFn("debug", "update toast failed", { error: errStr(err) }))
       }
     } finally {
-      await rm(tempDir, { recursive: true, force: true }).catch(() => {})
+      // Best-effort temp cleanup — log on failure so orphaned dirs don't go unnoticed.
+      await rm(tempDir, { recursive: true, force: true }).catch((rmErr) => {
+        logFn("debug", "could not remove update temp dir", { error: errStr(rmErr), path: tempDir })
+      })
     }
   } catch (err) {
     logFn("debug", "update check skipped", { error: errStr(err) })
