@@ -16,6 +16,29 @@ $ErrorActionPreference = 'Stop'
 $port = 4096
 $passwordFile = "$env:USERPROFILE\.opencode-server-password"
 $directoryFile = "$env:USERPROFILE\.opencode-server-directory"
+$funnelConfigFile = "$env:USERPROFILE\.opencode-funnel-url"
+
+# --- Build CORS allowlist from funnel URL + oc://renderer (desktop) ---
+# SECURITY: without this the desktop sidecar's wildcard CORS is exposed to
+# the public internet via Tailscale Funnel. Reading the funnel URL from
+# the config file written by setup-opencode-shared.ps1 keeps a single
+# source of truth. URL regex must match the same check the plugin uses
+# (mobile-sync.js readCorsAllowlist) so we reject the same malformed
+# inputs — defense in depth: the asar's JSON.parse is lenient, but a
+# half-written or hand-edited config file should not leak through.
+$corsOrigins = @('oc://renderer')
+if (Test-Path -LiteralPath $funnelConfigFile) {
+    $funnelUrl = (Get-Content -LiteralPath $funnelConfigFile -Raw).Trim()
+    # Validate: must be https://, must have a non-empty hostname that starts
+    # and ends with an alphanumeric. The `*` origin wildcard is also rejected
+    # here because it would defeat the whole point of the allowlist.
+    if ($funnelUrl -and $funnelUrl -ne '*' -and $funnelUrl -match '^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?$') {
+        $corsOrigins += $funnelUrl
+    } elseif ($funnelUrl) {
+        Write-Host "WARN: $funnelConfigFile contains invalid URL: '$funnelUrl' (expected https://hostname). Ignoring." -ForegroundColor Yellow
+    }
+}
+$corsJson = ($corsOrigins | ConvertTo-Json -Compress)
 
 # --- Load password from file. If missing, exit — the plugin generates it
 # on its first run, or setup-opencode-shared.ps1 does the same. We never
@@ -82,9 +105,12 @@ if ($existing) {
 
 # --- Set env vars for the desktop process ---
 # These are inherited by the sidecar via utilityProcess.fork().
+# OPENCODE_SERVER_CORS restricts the sidecar's CORS allowlist to the funnel URL
+# instead of wildcard; patch-opencode-desktop.ps1 makes the asar read this env var.
 # We clear them in a finally block so they don't persist in the parent shell.
 $env:OPENCODE_PORT = $port
 $env:OPENCODE_SERVER_PASSWORD = $password
+$env:OPENCODE_SERVER_CORS = $corsJson
 
 Write-Host ""
 Write-Host "OpenCode Desktop (Patched)" -ForegroundColor Green
@@ -118,4 +144,5 @@ if ($Detached) {
 } finally {
     Remove-Item Env:\OPENCODE_PORT -ErrorAction SilentlyContinue
     Remove-Item Env:\OPENCODE_SERVER_PASSWORD -ErrorAction SilentlyContinue
+    Remove-Item Env:\OPENCODE_SERVER_CORS -ErrorAction SilentlyContinue
 }

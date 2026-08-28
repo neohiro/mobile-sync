@@ -57,7 +57,12 @@ $tempDir = "$env:TEMP\opencode-asar-patch"
 # Strings that indicate the patch is applied
 $patchedPasswordStr = 'process.env.OPENCODE_SERVER_PASSWORD || randomUUID()'
 $originalPasswordStr = 'randomUUID()'
-$patchedCorsStr = 'cors: ["*"]'
+# SECURITY: read CORS origins from OPENCODE_SERVER_CORS env var rather than
+# hardcoding ["*"]. The mobile-sync plugin (start-opencode-desktop.ps1) sets
+# this env var to ["oc://renderer","https://<funnel>"] so the sidecar is
+# never exposed to wildcard origins. Default fallback is ["*"] only for
+# first-run compatibility before the plugin has loaded.
+$patchedCorsStr = "cors: JSON.parse(process.env.OPENCODE_SERVER_CORS || '[""*""]')"
 $originalCorsStr = 'cors: ["oc://renderer"]'
 
 # --- Verify Python ---
@@ -237,6 +242,6 @@ Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host ""
 Write-Host "Patches applied:" -ForegroundColor Green
 Write-Host "  1. Password: OPENCODE_SERVER_PASSWORD env var respected" -ForegroundColor Gray
-Write-Host "  2. CORS: all origins allowed (for Tailscale Funnel)" -ForegroundColor Gray
+Write-Host "  2. CORS: OPENCODE_SERVER_CORS env var (funnel URL + oc://renderer); wildcard fallback only if env var unset" -ForegroundColor Gray
 Write-Host ""
 Write-Host "Launch with: .\start-opencode-desktop.ps1" -ForegroundColor Cyan

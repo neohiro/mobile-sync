@@ -97,9 +97,9 @@ if ($Detached) {
     exit 0
 }
 
-# --- Patch markers ---
+# --- Patch markers (must match patch-opencode-desktop.ps1) ---
 $patchedPasswordStr = 'process.env.OPENCODE_SERVER_PASSWORD || randomUUID()'
-$patchedCorsStr = 'cors: ["*"]'
+$patchedCorsStr = "cors: JSON.parse(process.env.OPENCODE_SERVER_CORS || '[""*""]')"
 
 # Write PID file even in foreground mode (for -Stop compatibility)
 Set-Content $pidFile $PID -Encoding Ascii

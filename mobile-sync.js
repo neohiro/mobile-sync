@@ -26,7 +26,7 @@
 import { execFile, spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { readFile, writeFile, mkdir, rm, readdir, rename } from "node:fs/promises"
-import { readFileSync, writeFileSync, existsSync, renameSync } from "node:fs"
+import { readFileSync, writeFileSync, existsSync, renameSync, rmSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { homedir, platform, tmpdir } from "node:os"
 import { createConnection } from "node:net"
@@ -59,9 +59,19 @@ function loadCache() {
   }
 }
 function saveCache(cache) {
-  // Serialize writes so two concurrent updaters can't interleave JSON bytes.
-  const next = _cacheWriteChain.then(() => {
-    try { writeFileSync(CACHE_FILE, JSON.stringify(cache)) } catch {}
+  // Serialize writes so two concurrent updaters can't interleave JSON bytes,
+  // AND use temp+rename so a crash mid-write doesn't leave a half-written
+  // file (which would fail the next loadCache() parse and silently fall
+  // back to no cache).
+  const next = _cacheWriteChain.then(async () => {
+    const tmp = CACHE_FILE + ".tmp"
+    try {
+      writeFileSync(tmp, JSON.stringify(cache))
+      renameSync(tmp, CACHE_FILE)
+    } catch (err) {
+      logFnOnce("warn", "could not persist update cache", { error: errStr(err) })
+      try { rmSync(tmp, { force: true }) } catch {}
+    }
   })
   // Swallow rejections on the chain itself so one bad write doesn't poison
   // subsequent saves. The .then handler already catches its own write errors.
@@ -79,6 +89,32 @@ const PS_FLAGS = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive"]
 const PASSWORD_FILE = join(homedir(), ".opencode-server-password")
 const DIRECTORY_FILE = join(homedir(), ".opencode-server-directory")
 const FUNNEL_URL_FILE = join(homedir(), ".opencode-funnel-url")
+/**
+ * Read the CORS allowlist for the desktop sidecar from FUNNEL_URL_FILE.
+ * Always includes "oc://renderer" so the desktop app can reach the sidecar
+ * locally. When the funnel file is present and contains a valid https://
+ * origin, that origin is appended (the only legitimate remote origin via
+ * Tailscale Funnel).
+ *
+ * SECURITY: this is the allowlist that limits who can reach the opencode
+ * sidecar over Tailscale Funnel. Without this, the patched app.asar falls
+ * back to ["*"] and the sidecar is exposed to the public internet. The
+ * regex on the URL is a defense-in-depth check against arbitrary-origin
+ * injection: it must be https://, must have a non-empty hostname that
+ * starts and ends with an alphanumeric character.
+ */
+function readCorsAllowlist() {
+  const origins = ["oc://renderer"]
+  try {
+    if (existsSync(FUNNEL_URL_FILE)) {
+      const url = readFileSync(FUNNEL_URL_FILE, "utf8").trim()
+      if (/^https:\/\/[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/i.test(url)) {
+        origins.push(url)
+      }
+    }
+  } catch { /* fall through with just oc://renderer */ }
+  return JSON.stringify(origins)
+}
 /**
  * Generate a cryptographically random URL-safe password (24 chars, ~142 bits entropy).
  * Used on first install when no password file exists yet.
@@ -534,12 +570,20 @@ async function _runUpdate(logFn, osNotify) {
             await copyFile(pluginSrc, pluginDest)
           } catch (copyErr) {
             // Restore the previous version so the next load still works.
-            await rename(backup, pluginDest).catch(() => {})
+            await rename(backup, pluginDest).catch((restoreErr) => {
+              logFn("error", "could not restore plugin backup after failed copy", {
+                error: errStr(restoreErr),
+                hint: "plugin may be in inconsistent state; check $backup file",
+              })
+            })
             throw copyErr
           }
-          // Successful update ΓÇö remove the backup to avoid accumulating
-          // stale .bak files across many updates.
-          await rm(backup, { force: true }).catch(() => {})
+          // Successful update — remove the backup to avoid accumulating
+          // stale .bak files across many updates. Log if cleanup fails so the
+          // user can manually clean up rather than wondering why a .bak persists.
+          await rm(backup, { force: true }).catch((rmErr) => {
+            logFn("debug", "could not remove plugin backup file", { error: errStr(rmErr) })
+          })
         }
 
         const pkgSrc = join(srcDir, "package.json")
@@ -553,7 +597,10 @@ async function _runUpdate(logFn, osNotify) {
           .catch((err) => logFn("debug", "update toast failed", { error: errStr(err) }))
       }
     } finally {
-      await rm(tempDir, { recursive: true, force: true }).catch(() => {})
+      // Best-effort temp cleanup — log on failure so orphaned dirs don't go unnoticed.
+      await rm(tempDir, { recursive: true, force: true }).catch((rmErr) => {
+        logFn("debug", "could not remove update temp dir", { error: errStr(rmErr), path: tempDir })
+      })
     }
   } catch (err) {
     logFn("debug", "update check skipped", { error: errStr(err) })
@@ -751,6 +798,13 @@ const MobileSyncPlugin = async ({ $ }) => {
       }
       if (!output.env.OPENCODE_SERVER_PASSWORD) {
         output.env.OPENCODE_SERVER_PASSWORD = password
+      }
+      // Set the CORS allowlist for the patched app.asar sidecar. Defaults to
+      // ["oc://renderer"] before the funnel URL is configured; after setup the
+      // allowlist includes the Tailscale Funnel URL. Without this injection the
+      // app.asar sidecar falls back to wildcard CORS (security issue).
+      if (!output.env.OPENCODE_SERVER_CORS) {
+        output.env.OPENCODE_SERVER_CORS = readCorsAllowlist()
       }
     },
 

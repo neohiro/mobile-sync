@@ -10,7 +10,7 @@ On startup, the plugin automatically:
 2. **Launches the desktop sidecar** if port 4096 is not listening and the desktop is installed
 3. **Falls back to the CLI server** (`opencode serve`) if the desktop isn't running — keeps mobile access alive from device boot
 4. **Starts the auto-repatch watcher** to re-apply desktop patches after updates
-5. **Injects** `OPENCODE_PORT=4096` and `OPENCODE_SERVER_PASSWORD` into shell commands
+5. **Injects** `OPENCODE_PORT=4096`, `OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_CORS` into shell commands
 6. **Checks for plugin updates** hourly from GitHub releases
 
 ## Why CLI Fallback
@@ -183,7 +183,7 @@ To disable the plugin, either set `MOBILE_SYNC_ENABLED=0` in your environment or
 1. Verify Tailscale Funnel: `tailscale funnel status`
 2. Verify server is running: `Test-NetConnection -ComputerName 127.0.0.1 -Port 4096`
 3. Check connection details: `& "$env:USERPROFILE\.config\opencode\plugins\mobile-sync-scripts\show-connection.ps1"`
-4. Check that CORS matches the Funnel URL — the `--cors` flag in `start-opencode-server.ps1` must match your Tailscale DNS name exactly
+4. Check that CORS matches the Funnel URL — `start-opencode-desktop.ps1` sets `OPENCODE_SERVER_CORS` from `~/.opencode-funnel-url`; the patched `app.asar` reads this env var to build its CORS allowlist. If the file is missing, only `oc://renderer` is allowed (mobile app will be blocked).
 
 ### Sidecar not launching
 
