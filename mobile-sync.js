@@ -26,7 +26,7 @@
 import { execFile, spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { readFile, writeFile, mkdir, rm, readdir, rename } from "node:fs/promises"
-import { readFileSync, writeFileSync, existsSync, renameSync } from "node:fs"
+import { readFileSync, writeFileSync, existsSync, renameSync, rmSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { homedir, platform, tmpdir } from "node:os"
 import { createConnection } from "node:net"
@@ -59,9 +59,19 @@ function loadCache() {
   }
 }
 function saveCache(cache) {
-  // Serialize writes so two concurrent updaters can't interleave JSON bytes.
-  const next = _cacheWriteChain.then(() => {
-    try { writeFileSync(CACHE_FILE, JSON.stringify(cache)) } catch {}
+  // Serialize writes so two concurrent updaters can't interleave JSON bytes,
+  // AND use temp+rename so a crash mid-write doesn't leave a half-written
+  // file (which would fail the next loadCache() parse and silently fall
+  // back to no cache).
+  const next = _cacheWriteChain.then(async () => {
+    const tmp = CACHE_FILE + ".tmp"
+    try {
+      writeFileSync(tmp, JSON.stringify(cache))
+      renameSync(tmp, CACHE_FILE)
+    } catch (err) {
+      logFnOnce("warn", "could not persist update cache", { error: errStr(err) })
+      try { rmSync(tmp, { force: true }) } catch {}
+    }
   })
   // Swallow rejections on the chain itself so one bad write doesn't poison
   // subsequent saves. The .then handler already catches its own write errors.

@@ -208,6 +208,42 @@ test("control char in ETag rejected", () => assert.doesNotMatch(`W/"${"a".repeat
 test("empty string rejected", () => assert.doesNotMatch("", etagRe))
 test("plain word 16+ chars accepted", () => assert.match("aaaaaaaaaaaaaaaa", etagRe))
 
+console.log("\nsaveCache (atomic write)")
+// Mirror production: temp + rename so a crash mid-write doesn't corrupt.
+let _chain = Promise.resolve()
+async function saveCache(cache, file) {
+  const next = _chain.then(() => {
+    const tmp = file + ".tmp"
+    writeFileSync(tmp, JSON.stringify(cache))
+    renameSync(tmp, file)
+  })
+  _chain = next.catch(() => {})
+  return next
+}
+test("write creates file with correct JSON", async () => {
+  const f = join(testDir, "cache-1.json")
+  await saveCache({ etag: "abc", version: "1.0.0" }, f)
+  assert.equal(readFileSync(f, "utf8"), JSON.stringify({ etag: "abc", version: "1.0.0" }))
+})
+test("concurrent writes are serialized (final value is one of the inputs, not interleaved)", async () => {
+  const f = join(testDir, "cache-2.json")
+  const promises = []
+  for (let i = 0; i < 50; i++) {
+    promises.push(saveCache({ etag: `e${i}`, version: "1.0.0" }, f))
+  }
+  await Promise.all(promises)
+  // File must be valid JSON, not interleaved bytes from concurrent writers
+  const parsed = JSON.parse(readFileSync(f, "utf8"))
+  assert.equal(parsed.version, "1.0.0")
+  assert.match(parsed.etag, /^e\d+$/)
+})
+test("read after write round-trips correctly", async () => {
+  const f = join(testDir, "cache-3.json")
+  await saveCache({ etag: "deadbeef", version: "2.0.0" }, f)
+  const got = JSON.parse(readFileSync(f, "utf8"))
+  assert.deepEqual(got, { etag: "deadbeef", version: "2.0.0" })
+})
+
 console.log("\nlogFnOnce (deduplication)")
 const _loggedOnce = new Set()
 let _sink = []
