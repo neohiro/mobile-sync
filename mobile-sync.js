@@ -80,6 +80,32 @@ const PASSWORD_FILE = join(homedir(), ".opencode-server-password")
 const DIRECTORY_FILE = join(homedir(), ".opencode-server-directory")
 const FUNNEL_URL_FILE = join(homedir(), ".opencode-funnel-url")
 /**
+ * Read the CORS allowlist for the desktop sidecar from FUNNEL_URL_FILE.
+ * Always includes "oc://renderer" so the desktop app can reach the sidecar
+ * locally. When the funnel file is present and contains a valid https://
+ * origin, that origin is appended (the only legitimate remote origin via
+ * Tailscale Funnel).
+ *
+ * SECURITY: this is the allowlist that limits who can reach the opencode
+ * sidecar over Tailscale Funnel. Without this, the patched app.asar falls
+ * back to ["*"] and the sidecar is exposed to the public internet. The
+ * regex on the URL is a defense-in-depth check against arbitrary-origin
+ * injection: it must be https://, must have a non-empty hostname that
+ * starts and ends with an alphanumeric character.
+ */
+function readCorsAllowlist() {
+  const origins = ["oc://renderer"]
+  try {
+    if (existsSync(FUNNEL_URL_FILE)) {
+      const url = readFileSync(FUNNEL_URL_FILE, "utf8").trim()
+      if (/^https:\/\/[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/i.test(url)) {
+        origins.push(url)
+      }
+    }
+  } catch { /* fall through with just oc://renderer */ }
+  return JSON.stringify(origins)
+}
+/**
  * Generate a cryptographically random URL-safe password (24 chars, ~142 bits entropy).
  * Used on first install when no password file exists yet.
  */
@@ -751,6 +777,13 @@ const MobileSyncPlugin = async ({ $ }) => {
       }
       if (!output.env.OPENCODE_SERVER_PASSWORD) {
         output.env.OPENCODE_SERVER_PASSWORD = password
+      }
+      // Set the CORS allowlist for the patched app.asar sidecar. Defaults to
+      // ["oc://renderer"] before the funnel URL is configured; after setup the
+      // allowlist includes the Tailscale Funnel URL. Without this injection the
+      // app.asar sidecar falls back to wildcard CORS (security issue).
+      if (!output.env.OPENCODE_SERVER_CORS) {
+        output.env.OPENCODE_SERVER_CORS = readCorsAllowlist()
       }
     },
 
