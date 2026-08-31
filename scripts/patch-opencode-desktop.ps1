@@ -57,7 +57,13 @@ $tempDir = "$env:TEMP\opencode-asar-patch"
 # Strings that indicate the patch is applied
 $patchedPasswordStr = 'process.env.OPENCODE_SERVER_PASSWORD || randomUUID()'
 $originalPasswordStr = 'randomUUID()'
-$patchedCorsStr = 'cors: ["*"]'
+# SECURITY: read CORS origins from OPENCODE_SERVER_CORS env var rather than hardcoding
+# ["*"]. Defaults to ["*"] only if the env var is unset (e.g. first run before
+# setup-opencode-shared.ps1 writes the funnel URL). After setup, this will be the
+# Tailscale Funnel URL — the only legitimate remote origin.
+# The matched string must be exactly what we write into sidecar.js; the JS
+# in the asar must be syntactically valid (note: balanced [' "] brackets).
+$patchedCorsStr = "cors: JSON.parse(process.env.OPENCODE_SERVER_CORS || '[""*""]')"
 $originalCorsStr = 'cors: ["oc://renderer"]'
 
 # --- Verify Python ---
@@ -65,9 +71,13 @@ $python = $null
 $candidates = @(
     "python"
     "python3"
+    "py"
     "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe"
     "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe"
+    "$env:LOCALAPPDATA\Programs\Python\Python314\python.exe"
     "$env:ProgramFiles\Python312\python.exe"
+    "$env:ProgramFiles\Python313\python.exe"
+    "$env:ProgramFiles\Python314\python.exe"
 )
 foreach ($c in $candidates) {
     try {
@@ -86,17 +96,19 @@ Write-Host "app.asar: $asarPath" -ForegroundColor Gray
 function Expand-Asar {
     if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
-    $src = $asarPath -replace '\\','/'
-    $dst = $tempDir -replace '\\','/'
-    & $python -c "import asar; asar.extract_archive(__import__('pathlib').Path(r'$src'), __import__('pathlib').Path(r'$dst'))" 2>&1
+    $src = [System.IO.Path]::GetFullPath($asarPath)
+    $dst = [System.IO.Path]::GetFullPath($tempDir)
+    $pyScript = "import asar, pathlib; asar.extract_archive(pathlib.Path(r'$src'), pathlib.Path(r'$dst'))"
+    & $python -c $pyScript 2>&1
     if ($LASTEXITCODE -ne 0) { throw "Failed to extract app.asar" }
 }
 
 # --- Helper: repack asar ---
 function Compress-Asar {
-    $src = $tempDir -replace '\\','/'
-    $dst = $asarPath -replace '\\','/'
-    & $python -c "import asar; asar.create_archive(__import__('pathlib').Path(r'$src'), __import__('pathlib').Path(r'$dst'))" 2>&1
+    $src = [System.IO.Path]::GetFullPath($tempDir)
+    $dst = [System.IO.Path]::GetFullPath($asarPath)
+    $pyScript = "import asar, pathlib; asar.create_archive(pathlib.Path(r'$src'), pathlib.Path(r'$dst'))"
+    & $python -c $pyScript 2>&1
     if ($LASTEXITCODE -ne 0) { throw "Failed to repack app.asar" }
 }
 
@@ -124,12 +136,12 @@ function Set-Patches {
     $indexJs = Join-Path $tempDir "out\main\index.js"
     $sidecarJs = Join-Path $tempDir "out\main\sidecar.js"
 
-    # Patch 1: password fallback
+    # Patch 1: password fallback - handle various spacing patterns
     $content = Get-Content $indexJs -Raw
     if ($content.Contains($patchedPasswordStr)) {
         Write-Host "  Password patch already applied." -ForegroundColor Gray
-    } elseif ($content.Contains("const password = $originalPasswordStr")) {
-        $content = $content.Replace("const password = $originalPasswordStr", "const password = $patchedPasswordStr")
+    } elseif ($content -match 'const\s+password\s*=\s*randomUUID\(\)') {
+        $content = $content -replace 'const\s+password\s*=\s*randomUUID\(\)', "const password = $patchedPasswordStr"
         Write-Utf8NoBom $indexJs $content
         Write-Host "  Password patch applied." -ForegroundColor Green
     } else {
@@ -155,8 +167,8 @@ if ($Restore) {
         throw "No backup found at: $bakPath"
     }
     $bakSize = (Get-Item -LiteralPath $bakPath).Length
-    if ($bakSize -lt 10MB) {
-        throw "Backup suspiciously small (${bakSize} bytes). Expected ~143MB. Not restoring to avoid bricking."
+    if ($bakSize -lt 50MB) {
+        throw "Backup suspiciously small (${bakSize} bytes). Expected ~140MB+. Not restoring to avoid bricking."
     }
     Copy-Item $bakPath $asarPath -Force
     Write-Host "Restored original app.asar from backup." -ForegroundColor Green
@@ -237,6 +249,6 @@ Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host ""
 Write-Host "Patches applied:" -ForegroundColor Green
 Write-Host "  1. Password: OPENCODE_SERVER_PASSWORD env var respected" -ForegroundColor Gray
-Write-Host "  2. CORS: all origins allowed (for Tailscale Funnel)" -ForegroundColor Gray
+Write-Host "  2. CORS: OPENCODE_SERVER_CORS env var (funnel URL or oc://renderer); falls back to ['*'] only if unset" -ForegroundColor Gray
 Write-Host ""
 Write-Host "Launch with: .\start-opencode-desktop.ps1" -ForegroundColor Cyan

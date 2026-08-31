@@ -38,13 +38,18 @@ function New-SecurePassword {
     return $result
 }
 
+function Write-Utf8NoBom {
+    param([string]$Path, [string]$Value)
+    [System.IO.File]::WriteAllText($Path, $Value, [System.Text.UTF8Encoding]::new($false))
+}
+
 # --- Guard: password file ---
 if ($PSBoundParameters.ContainsKey('Password')) {
     if (-not $Password) { throw "-Password cannot be empty. Pass a non-empty value or omit the parameter." }
-    [System.IO.File]::WriteAllText($passwordFile, $Password)
+    Write-Utf8NoBom $passwordFile $Password
 } elseif (-not (Test-Path -LiteralPath $passwordFile)) {
     $generated = New-SecurePassword
-    [System.IO.File]::WriteAllText($passwordFile, $generated)
+    Write-Utf8NoBom $passwordFile $generated
     Write-Host "Generated new random password (saved to $passwordFile)" -ForegroundColor Cyan
 }
 $password = (Get-Content -LiteralPath $passwordFile -Raw).Trim()
@@ -54,7 +59,7 @@ if (-not $password) { throw "Password file is empty: $passwordFile" }
 # The CLI server has no --directory flag, so it serves ALL projects it can find
 # in its working directory. We launch from $HOME so every project the user has
 # is visible. The mobile app can use the Directory field to filter.
-[System.IO.File]::WriteAllText($directoryFile, $env:USERPROFILE)
+Write-Utf8NoBom $directoryFile $env:USERPROFILE
 $homeDir = $env:USERPROFILE
 
 # --- Load saved funnel URL or detect from Tailscale ---
@@ -75,7 +80,7 @@ if (-not $funnelUrl) {
                     $dnsName = $tsSelf.DNSName.TrimEnd('.')
                     $hostName = $tsSelf.HostName
                     $funnelUrl = "https://$dnsName"
-                    [System.IO.File]::WriteAllText($funnelConfigFile, $funnelUrl)
+                    Write-Utf8NoBom $funnelConfigFile $funnelUrl
                     Write-Host "Detected Tailscale Funnel URL: $funnelUrl (hostname: $hostName)" -ForegroundColor DarkGray
                 }
             } catch { /* ConvertFrom-Json failed on malformed output */ }
@@ -109,11 +114,27 @@ if (-not $exe) {
 
 if (-not $exe) { throw "opencode.exe not found. Install via: winget install SST.opencode" }
 
+# --- Build CORS allowlist from funnel URL + oc://renderer (desktop) ---
+# SECURITY: without this the CLI server's wildcard CORS is exposed to the
+# public internet via Tailscale Funnel. Reading the funnel URL from the
+# config file written by setup-opencode-shared.ps1 keeps a single source of
+# truth. URL regex must match the same check the plugin uses
+# (mobile-sync.js readCorsAllowlist) so we reject the same malformed
+# inputs — defense in depth.
+$corsOrigins = @('oc://renderer')
+if ($funnelUrl -and $funnelUrl -ne '*' -and $funnelUrl -match '^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(/.*)?$') {
+    $corsOrigins += $funnelUrl
+} elseif ($funnelUrl) {
+    Write-Host "WARN: $funnelConfigFile contains invalid URL: '$funnelUrl' (expected https://hostname). Ignoring." -ForegroundColor Yellow
+}
+$corsJson = ($corsOrigins | ConvertTo-Json -Compress)
+
 # --- IMPORTANT: env vars are process-scoped only ---
 # NEVER set OPENCODE_* globally in the registry - it bricks the desktop client.
 # We also clear it in `finally` so the parent PowerShell session doesn't leak
 # the password to other commands after this script exits.
 $env:OPENCODE_SERVER_PASSWORD = $password
+$env:OPENCODE_SERVER_CORS = $corsJson
 
 # Launch the server from the user's home directory so ALL project directories
 # are visible. The mobile app's "Directory" field filters to one project.
@@ -144,7 +165,7 @@ Write-Host ""
 
 if ($Detached) {
     $serveArgs = @("serve", "--hostname", $bindHost, "--port", $port)
-    if ($funnelUrl) { $serveArgs += "--cors=$funnelUrl" }
+    $serveArgs += "--cors=$corsJson"
     $proc = Start-Process -FilePath $exe -ArgumentList $serveArgs `
         -WindowStyle Hidden -PassThru
     Write-Host "Server started (PID $($proc.Id)). Waiting for port $port..." -ForegroundColor Green
@@ -162,15 +183,12 @@ if ($Detached) {
         Write-Host "  WARNING: Port $port not yet listening after 10s. Server may still be starting." -ForegroundColor Yellow
     }
 } else {
-    if ($funnelUrl) {
-        & $exe serve --hostname $bindHost --port $port --cors=$funnelUrl
-    } else {
-        & $exe serve --hostname $bindHost --port $port
-    }
+    & $exe serve --hostname $bindHost --port $port --cors=$corsJson
 }
 } finally {
     Pop-Location
-    # Clear the password from the parent process's environment so it doesn't
+    # Clear the env vars from the parent process's environment so they don't
     # leak to other commands run from the same PowerShell session.
     Remove-Item Env:\OPENCODE_SERVER_PASSWORD -ErrorAction SilentlyContinue
+    Remove-Item Env:\OPENCODE_SERVER_CORS -ErrorAction SilentlyContinue
 }

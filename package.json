@@ -1,7 +1,7 @@
 {
   "name": "mobile-sync",
-  "version": "1.0.2",
-  "description": "OpenCode plugin for mobile sync via Tailscale Funnel",
+  "version": "1.1.0",
+  "description": "Cross-platform OpenCode plugin for mobile sync via Tailscale Funnel \u2014 native TUI toast (client.tui.showToast) with OS fallback, works on Windows/macOS/Linux with every OpenCode client",
   "type": "module",
   "scripts": {
     "build": "bun build mobile-sync.js --target=node --no-bundle --outdir .",
@@ -9,5 +9,25 @@
   },
   "devDependencies": {
     "bun-types": "latest"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tailscale",
+    "tailscale-funnel",
+    "mobile",
+    "android",
+    "cross-platform",
+    "windows",
+    "macos",
+    "linux",
+    "tui",
+    "toast",
+    "sync"
+  ],
+  "homepage": "https://github.com/neohiro/mobile-sync#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/neohiro/mobile-sync.git"
   }
 }
