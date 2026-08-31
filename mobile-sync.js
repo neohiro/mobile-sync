@@ -29,12 +29,12 @@
 import { execFile, spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { readFile, writeFile, mkdir, rm, readdir, rename } from "node:fs/promises"
-import { readFileSync, writeFileSync, existsSync, renameSync } from "node:fs"
+import { readFileSync, writeFileSync, existsSync, renameSync, unlinkSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { homedir, platform, tmpdir } from "node:os"
 import { createConnection } from "node:net"
 
-const MOBILE_SYNC_VERSION = "1.1.0"
+const MOBILE_SYNC_VERSION = "1.1.1"
 const GITHUB_REPO = "neohiro/mobile-sync"
 const UPDATE_CHECK_INTERVAL_MS = 3_600_000 // hourly
 const DEFAULT_PORT = 4096
@@ -209,7 +209,9 @@ function createOsNotifier({ $, systemRoot = process.env.SystemRoot } = {}) {
         return true
       }
       if (platform() === "darwin") {
-        const script = `display notification ${shQuote(message)} with title ${shQuote(title)}`
+        // AppleScript strings are double-quoted; escape backslash and double-quote.
+        const esc = (s) => String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+        const script = `display notification "${esc(message)}" with title "${esc(title)}"`
         await withTimeout(new Promise((resolve, reject) => {
           execFile("osascript", ["-e", script], { timeout: NOTIFIER_TIMEOUT_MS }, (err) => err ? reject(err) : resolve())
         }))
@@ -244,25 +246,40 @@ function createOsNotifier({ $, systemRoot = process.env.SystemRoot } = {}) {
 // call throws/returns falsy, falls back to the OS notifier. Returns true if
 // either path succeeded so callers can distinguish delivered vs lost.
 function createNotifier({ client, $ } = {}) {
-  const notify = createNotifier({ client, $ })
-  const variantMap = (v) => ["info", "success", "warning", "error"].includes(v) ? v : "info"
+  const osNotify = createOsNotifier({ $ })
+  const variantMap = (v) => {
+    const s = String(v ?? "info").toLowerCase()
+    return ["info", "success", "warning", "error"].includes(s) ? s : "info"
+  }
+  const clamp = (s, n) => {
+    const str = String(s ?? "")
+    return str.length > n ? str.slice(0, n - 1) + "\u2026" : str
+  }
   return async (title, message, variant = "info") => {
+    const t = clamp(title, 120)
+    const m = clamp(message, 300)
     const v = variantMap(variant)
     if (client?.tui?.showToast && typeof client.tui.showToast === "function") {
-      try {
-        const res = await client.tui.showToast({ body: { title, message, variant: v, duration: 5000 } })
+      const tryNative = async (body) => {
+        // Guard against hanging TUI (headless serve) — 4s timeout
+        const p = client.tui.showToast({ body })
+        const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("toast timeout")), 4000))
+        const res = await Promise.race([p, timeout])
         if (res === false) throw new Error("native toast returned false")
+        return true
+      }
+      try {
+        await tryNative({ title: t, message: m, variant: v, duration: 5000 })
         return true
       } catch {
         try {
-          const res2 = await client.tui.showToast({ body: { message: title ? `${title}: ${message}` : message, variant: v, duration: 5000 } })
-          if (res2 === false) throw new Error("native toast retry returned false")
+          await tryNative({ message: t ? `${t}: ${m}` : m, variant: v, duration: 5000 })
           return true
         } catch {}
       }
     }
     try {
-      const ok = await osNotify(title, message)
+      const ok = await osNotify(t, m)
       return !!ok
     } catch { return false }
   }
@@ -315,10 +332,27 @@ function readPassword() {
     }
     return generated
   }
-  // Validate password format (base64url, ~24 chars)
+  // Validate password format (base64url, ~24 chars). If invalid, atomically
+  // overwrite the corrupted file and return a fresh secret instead of recursing
+  // (recursion would re-read the same bad file forever).
   if (!/^[A-Za-z0-9_-]{20,}$/.test(raw)) {
     logFnOnce("warn", "password file contains invalid format, regenerating", { path: PASSWORD_FILE })
-    return readPassword() // Recursive call with fresh file
+    const generated = generatePassword()
+    const tmpPath = PASSWORD_FILE + ".tmp"
+    try {
+      writeFileSync(tmpPath, generated + "\n", { mode: 0o600 })
+      try {
+        renameSync(tmpPath, PASSWORD_FILE)
+      } catch {
+        // Windows: target exists — overwrite in place
+        try { writeFileSync(PASSWORD_FILE, generated + "\n", { mode: 0o600 }) } catch {}
+        try { unlinkSync(tmpPath) } catch {}
+      }
+    } catch (err) {
+      logFnOnce("warn", "could not persist regenerated password; using ephemeral one", { error: errStr(err) })
+      return generated
+    }
+    return generated
   }
   return raw
 }
@@ -488,6 +522,10 @@ async function ensureSidecarRunning(logFn) {
     }
   }
 
+  if (!scriptsDir) {
+    logFn("warn", "scriptsDir not resolved, cannot launch Windows server wrapper")
+    return { launched: false, pid: null }
+  }
   const launcher = join(scriptsDir, "start-opencode-server.ps1")
   if (!existsSync(launcher)) {
     logFn("warn", "server launcher not found", { path: launcher })
@@ -826,15 +864,14 @@ const MobileSyncPlugin = async ({ client, $ }) => {
       watchdogStarting = false
     }
   }
-  // Only enable the watchdog on Windows where the CLI server runs.
-  if (isWindows) {
-    watchdogTimer = setInterval(() => {
-      ensureServerHealthy().catch((err) =>
-        logFn("debug", "watchdog tick failed", { error: errStr(err) })
-      )
-    }, WATCHDOG_INTERVAL_MS)
-    if (watchdogTimer.unref) watchdogTimer.unref()
-  }
+  // Watchdog runs on all platforms — POSIX now spawns opencode directly, so it
+  // needs the same liveness guarantee as Windows. Unref so it never blocks exit.
+  watchdogTimer = setInterval(() => {
+    ensureServerHealthy().catch((err) =>
+      logFn("debug", "watchdog tick failed", { error: errStr(err) })
+    )
+  }, WATCHDOG_INTERVAL_MS)
+  if (watchdogTimer.unref) watchdogTimer.unref()
 
   // ΓöÇΓöÇ Deferred init: run heavy work AFTER returning hooks ΓöÇΓöÇ
   // This prevents the plugin from blocking OpenCode's GUI startup.
@@ -847,8 +884,8 @@ const MobileSyncPlugin = async ({ client, $ }) => {
       launcherPid = sidecar.pid
 
       // Start watcher only if desktop is installed (watcher re-patches desktop app.asar).
-      // CLI server doesn't need a watcher.
-      const desktopInstalled = existsSync(join(scriptsDir, "start-opencode-desktop.ps1"))
+      // CLI server doesn't need a watcher. Guard scriptsDir null (e.g. plugin loaded via custom abs path).
+      const desktopInstalled = !!scriptsDir && existsSync(join(scriptsDir, "start-opencode-desktop.ps1"))
       const portIsUp = sidecar.launched || (await isPortListening(port))
       if (portIsUp && desktopInstalled) {
         watcherProc = startWatcher(logFn)
@@ -915,7 +952,7 @@ const MobileSyncPlugin = async ({ client, $ }) => {
         if (!event || typeof event.type !== "string") return
 
         if (event.type === "session.idle") {
-          if (!isWindows || relaunching) return
+          if (relaunching) return
           // If we just attempted a relaunch, give the new process a few
           // seconds to bind the port before probing again. The watchdog
           // (running every 30s) handles the long-term recovery; this hook
