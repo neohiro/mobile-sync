@@ -169,7 +169,7 @@ if ($Rotate) {
     $newPassword = New-SecurePassword
     $oldPassword = ''
     if (Test-Path -LiteralPath $passwordFile) {
-        $oldPassword = (Get-Content -LiteralPath $passwordFile -Raw).Trim()
+        $oldPassword = (Get-Content -LiteralPath $passwordFile -Raw).Replace([string][char]0xFEFF,"").Trim()
     }
     Invoke-Step "Rotate password" -Action {
         [System.IO.File]::WriteAllText($passwordFile, $newPassword)
@@ -191,6 +191,7 @@ if ($Rotate) {
 
 if ($PSBoundParameters.ContainsKey('Password')) {
     if (-not $Password) { throw "-Password cannot be empty. Pass a non-empty value or omit the parameter." }
+    if ($Password -notmatch '^[A-Za-z0-9_-]{20,}$') { throw "-Password must be 20+ base64url chars (A-Za-z0-9_-) - got $($Password.Length) chars" }
     Invoke-Step "Write password from parameter" -Action {
         [System.IO.File]::WriteAllText($passwordFile, $Password)
         Write-Host "  Password set from parameter." -ForegroundColor Green
@@ -202,7 +203,7 @@ if ($PSBoundParameters.ContainsKey('Password')) {
     Write-Host "  Password file exists: $passwordFile" -ForegroundColor Green
     if (-not $Quick -and -not $WhatIf) {
         $regen = Read-Host "  Regenerate password? (y/N)"
-        if ($regen -eq 'y') {
+        if ($regen.Trim().ToLower() -in @('y','yes')) {
             $newPw = New-SecurePassword
             Invoke-Step "Generate new random password" -Action {
                 [System.IO.File]::WriteAllText($passwordFile, $newPw)
@@ -225,7 +226,7 @@ if ($PSBoundParameters.ContainsKey('Password')) {
 }
 
 if (Test-Path -LiteralPath $passwordFile) {
-    $finalPw = (Get-Content -LiteralPath $passwordFile -Raw).Trim()
+    $finalPw = (Get-Content -LiteralPath $passwordFile -Raw).Replace([string][char]0xFEFF,"").Trim()
     Write-Host "  Password: $finalPw" -ForegroundColor Gray
 } else {
     $finalPw = ''
@@ -281,7 +282,7 @@ if (Test-Path $tsPath) {
 
             Invoke-Step "Save funnel URL" -Action {
                 $configFile = "$env:USERPROFILE\.opencode-funnel-url"
-                [System.IO.File]::WriteAllText($configFile, $funnelUrl)
+                [System.IO.File]::WriteAllText($configFile, $funnelUrl, [System.Text.UTF8Encoding]::new($false))
                 Write-Host "  Saved funnel URL: $configFile" -ForegroundColor Gray
             } -Preview {
                 Write-Host "    Would write to: $env:USERPROFILE\.opencode-funnel-url" -ForegroundColor DarkGray

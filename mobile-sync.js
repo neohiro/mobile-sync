@@ -34,7 +34,7 @@ import { join, dirname } from "node:path"
 import { homedir, platform, tmpdir } from "node:os"
 import { createConnection } from "node:net"
 
-const MOBILE_SYNC_VERSION = "1.1.1"
+const MOBILE_SYNC_VERSION = "1.1.2"
 const GITHUB_REPO = "neohiro/mobile-sync"
 const UPDATE_CHECK_INTERVAL_MS = 3_600_000 // hourly
 const DEFAULT_PORT = 4096

@@ -117,7 +117,7 @@ if ($Register) {
     $deviceName = Get-DeviceName
     $password = ''
     if (Test-Path -LiteralPath $passwordFile) {
-        $password = (Get-Content -LiteralPath $passwordFile -Raw).Trim()
+        $password = (Get-Content -LiteralPath $passwordFile -Raw).Replace([string][char]0xFEFF,"").Trim()
     }
     if (-not $password) {
         throw "Password file not found: $passwordFile`nRun setup first: .\setup-opencode-shared.ps1"
@@ -170,7 +170,7 @@ if ($Register) {
 # --- Load password for both directory detection and display ---
 $password = ''
 if (Test-Path -LiteralPath $passwordFile) {
-    $password = (Get-Content -LiteralPath $passwordFile -Raw).Trim()
+    $password = (Get-Content -LiteralPath $passwordFile -Raw).Replace([string][char]0xFEFF,"").Trim()
 }
 
 # --- Detect server's current directory ---

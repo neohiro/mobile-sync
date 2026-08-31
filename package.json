@@ -1,6 +1,6 @@
 {
   "name": "mobile-sync",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Cross-platform OpenCode plugin for mobile sync via Tailscale Funnel \u2014 native TUI toast (client.tui.showToast) with OS fallback, works on Windows/macOS/Linux with every OpenCode client",
   "type": "module",
   "scripts": {
