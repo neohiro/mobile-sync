@@ -17,6 +17,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+function Write-Utf8NoBom {
+    param([string]$Path, [string]$Value)
+    [System.IO.File]::WriteAllText($Path, $Value, [System.Text.UTF8Encoding]::new($false))
+}
+
 $passwordFile = "$env:USERPROFILE\.opencode-server-password"
 $deviceRegistry = "$env:USERPROFILE\.opencode-devices.json"
 

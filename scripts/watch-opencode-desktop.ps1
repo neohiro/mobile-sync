@@ -75,9 +75,13 @@ if (-not $asarPath) {
 
 # --- Discover Python ---
 $python = $null
-$pyCandidates = @("python", "python3",
+$pyCandidates = @("python", "python3", "py",
     "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
-    "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe")
+    "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe",
+    "$env:LOCALAPPDATA\Programs\Python\Python314\python.exe",
+    "$env:ProgramFiles\Python312\python.exe",
+    "$env:ProgramFiles\Python313\python.exe",
+    "$env:ProgramFiles\Python314\python.exe")
 foreach ($c in $pyCandidates) {
     try { $null = & $c --version 2>&1; $python = $c; break } catch { }
 }
@@ -87,8 +91,9 @@ if (-not $python) {
 
 # --- If detached, re-launch ourselves hidden and exit ---
 if ($Detached) {
+    $argList = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -IntervalSeconds $IntervalSeconds"
     $proc = Start-Process -FilePath "powershell.exe" `
-        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`"" `
+        -ArgumentList $argList `
         -WindowStyle Hidden -PassThru
     Write-Host "Watcher started in background (PID $($proc.Id))." -ForegroundColor Green
     Set-Content $pidFile $proc.Id -Encoding Ascii
@@ -97,9 +102,9 @@ if ($Detached) {
     exit 0
 }
 
-# --- Patch markers ---
+# --- Patch markers (must match patch-opencode-desktop.ps1) ---
 $patchedPasswordStr = 'process.env.OPENCODE_SERVER_PASSWORD || randomUUID()'
-$patchedCorsStr = 'cors: ["*"]'
+$patchedCorsStr = "cors: JSON.parse(process.env.OPENCODE_SERVER_CORS || '[""*""]')"
 
 # Write PID file even in foreground mode (for -Stop compatibility)
 Set-Content $pidFile $PID -Encoding Ascii
@@ -138,9 +143,10 @@ try {
             if (Test-Path $tempDir) { Remove-Item $tempDir -Recurse -Force }
             New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
-            $src = $asarPath -replace '\\','/'
-            $dst = $tempDir -replace '\\','/'
-            & $python -c "import asar; asar.extract_archive(__import__('pathlib').Path(r'$src'), __import__('pathlib').Path(r'$dst'))" 2>&1 | Out-Null
+            $src = [System.IO.Path]::GetFullPath($asarPath)
+            $dst = [System.IO.Path]::GetFullPath($tempDir)
+            $pyScript = "import asar, pathlib; asar.extract_archive(pathlib.Path(r'$src'), pathlib.Path(r'$dst'))"
+            & $python -c $pyScript 2>&1 | Out-Null
             $extractFailed = ($LASTEXITCODE -ne 0)
 
             $needsPatch = $false

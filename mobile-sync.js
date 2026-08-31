@@ -3,6 +3,9 @@
  *
  * Makes the desktop sidecar (or CLI server as fallback) act as a shared server
  * on port 4096, accessible via Tailscale Funnel for mobile sync.
+ * Works cross-platform (Windows, macOS, Linux) and with every OpenCode client
+ * (desktop, TUI, web, CLI headless) — native in-app toast via
+ * client.tui.showToast() with OS notification fallback.
  *
  * On startup:
  *   1. Runs first-time setup if needed (password file, patch, funnel)
@@ -31,7 +34,7 @@ import { join, dirname } from "node:path"
 import { homedir, platform, tmpdir } from "node:os"
 import { createConnection } from "node:net"
 
-const MOBILE_SYNC_VERSION = "1.0.2"
+const MOBILE_SYNC_VERSION = "1.1.0"
 const GITHUB_REPO = "neohiro/mobile-sync"
 const UPDATE_CHECK_INTERVAL_MS = 3_600_000 // hourly
 const DEFAULT_PORT = 4096
@@ -60,8 +63,16 @@ function loadCache() {
 }
 function saveCache(cache) {
   // Serialize writes so two concurrent updaters can't interleave JSON bytes.
+  // Use atomic write via temp file + rename.
   const next = _cacheWriteChain.then(() => {
-    try { writeFileSync(CACHE_FILE, JSON.stringify(cache)) } catch {}
+    const tmpPath = CACHE_FILE + ".tmp"
+    try {
+      writeFileSync(tmpPath, JSON.stringify(cache))
+      renameSync(tmpPath, CACHE_FILE)
+    } catch (err) {
+      // Log but don't throw — cache is best-effort
+      logFnOnce("debug", "cache write failed", { error: errStr(err) })
+    }
   })
   // Swallow rejections on the chain itself so one bad write doesn't poison
   // subsequent saves. The .then handler already catches its own write errors.
@@ -79,6 +90,32 @@ const PS_FLAGS = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive"]
 const PASSWORD_FILE = join(homedir(), ".opencode-server-password")
 const DIRECTORY_FILE = join(homedir(), ".opencode-server-directory")
 const FUNNEL_URL_FILE = join(homedir(), ".opencode-funnel-url")
+/**
+ * Read the saved CORS allowlist for the desktop sidecar from
+ * FUNNEL_URL_FILE if present, returning a JSON string suitable for the
+ * `cors:` array. Always includes "oc://renderer" so the desktop app itself
+ * can reach the sidecar. Falls back to ["*"] if the funnel file is missing
+ * or unreadable (first run before setup).
+ *
+ * SECURITY: this is the allowlist that limits who can reach the opencode
+ * sidecar over Tailscale Funnel. Without this injection, the patched
+ * app.asar falls back to JSON.parse('["*"]') and the sidecar is exposed
+ * to the public internet.
+ */
+function readCorsAllowlist() {
+  const origins = ["oc://renderer"]
+  try {
+    if (existsSync(FUNNEL_URL_FILE)) {
+      const url = readFileSync(FUNNEL_URL_FILE, "utf8").trim()
+      // Validate: only accept https:// prefixed URLs with a non-empty hostname to prevent
+      // injection of arbitrary origin strings into the sidecar's CORS policy.
+      if (/^https:\/\/[a-z0-9]([a-z0-9.-]*[a-z0-9])?(\/.*)?$/i.test(url)) {
+        origins.push(url)
+      }
+    }
+  } catch { /* fall through with just oc://renderer */ }
+  return JSON.stringify(origins)
+}
 /**
  * Generate a cryptographically random URL-safe password (24 chars, ~142 bits entropy).
  * Used on first install when no password file exists yet.
@@ -146,6 +183,9 @@ try {
   } catch { exit 1 }
 }`
 
+// Shell-escape for POSIX sh -c strings (single-quote wrap)
+const shQuote = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'"
+
 const NOTIFIER_TIMEOUT_MS = 15_000
 function createOsNotifier({ $, systemRoot = process.env.SystemRoot } = {}) {
   const withTimeout = (p) =>
@@ -161,13 +201,69 @@ function createOsNotifier({ $, systemRoot = process.env.SystemRoot } = {}) {
   }
   return async (title, message) => {
     try {
-      if (!($ && typeof $ === "function")) return false
       if (isWindows) {
+        if (!($ && typeof $ === "function")) return false
         await runPowerShellToast(
           `${systemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
           title, message)
         return true
       }
+      if (platform() === "darwin") {
+        const script = `display notification ${shQuote(message)} with title ${shQuote(title)}`
+        await withTimeout(new Promise((resolve, reject) => {
+          execFile("osascript", ["-e", script], { timeout: NOTIFIER_TIMEOUT_MS }, (err) => err ? reject(err) : resolve())
+        }))
+        return true
+      }
+      if (platform() === "linux") {
+        const tryExec = (cmd, args) => new Promise((resolve, reject) => {
+          execFile(cmd, args, { timeout: NOTIFIER_TIMEOUT_MS }, (err) => err ? reject(err) : resolve())
+        })
+        try {
+          await withTimeout(tryExec("notify-send", [title, message, "--icon=dialog-information", "--expire-time=10000"]))
+          return true
+        } catch {}
+        try {
+          await withTimeout(tryExec("kdialog", ["--passivepopup", `${title}: ${message}`, "10"]))
+          return true
+        } catch {}
+        try {
+          await withTimeout(tryExec("zenity", ["--notification", `--text=${title}: ${message}`]))
+          return true
+        } catch {}
+        return false
+      }
+    } catch { return false }
+    return false
+  }
+}
+
+// ── Unified notifier: native TUI toast first, OS fallback ────────────────────
+// Tries client.tui.showToast({ body: { title, message, variant, duration } }).
+// If the TUI is unavailable (headless serve, older server, no client) or the
+// call throws/returns falsy, falls back to the OS notifier. Returns true if
+// either path succeeded so callers can distinguish delivered vs lost.
+function createNotifier({ client, $ } = {}) {
+  const notify = createNotifier({ client, $ })
+  const variantMap = (v) => ["info", "success", "warning", "error"].includes(v) ? v : "info"
+  return async (title, message, variant = "info") => {
+    const v = variantMap(variant)
+    if (client?.tui?.showToast && typeof client.tui.showToast === "function") {
+      try {
+        const res = await client.tui.showToast({ body: { title, message, variant: v, duration: 5000 } })
+        if (res === false) throw new Error("native toast returned false")
+        return true
+      } catch {
+        try {
+          const res2 = await client.tui.showToast({ body: { message: title ? `${title}: ${message}` : message, variant: v, duration: 5000 } })
+          if (res2 === false) throw new Error("native toast retry returned false")
+          return true
+        } catch {}
+      }
+    }
+    try {
+      const ok = await osNotify(title, message)
+      return !!ok
     } catch { return false }
   }
 }
@@ -219,6 +315,11 @@ function readPassword() {
     }
     return generated
   }
+  // Validate password format (base64url, ~24 chars)
+  if (!/^[A-Za-z0-9_-]{20,}$/.test(raw)) {
+    logFnOnce("warn", "password file contains invalid format, regenerating", { path: PASSWORD_FILE })
+    return readPassword() // Recursive call with fresh file
+  }
   return raw
 }
 
@@ -254,13 +355,20 @@ function runPS(scriptPath, args = [], opts = {}) {
 /** Run a PowerShell command string (not a file) and return a promise. */
 function runPSCommand(command, opts = {}) {
   return new Promise((resolve, reject) => {
-    execFile(PS_EXE, [...PS_FLAGS, "-Command", command], {
+    const timeout = opts.timeout || 60_000
+    const child = execFile(PS_EXE, [...PS_FLAGS, "-Command", command], {
       windowsHide: true,
-      timeout: opts.timeout || 60_000,
+      timeout,
       encoding: "utf8",
     }, (err, stdout, stderr) => {
       if (err && !opts.allowFail) reject(err)
       else resolve({ stdout: stdout || "", stderr: stderr || "", code: err?.code || 0 })
+    })
+    // Handle process killed by timeout
+    child.on("error", (e) => {
+      if (e.code === "ETIMEDOUT" || e.signal === "SIGTERM") {
+        reject(new Error(`PowerShell command timed out after ${timeout}ms`))
+      }
     })
   })
 }
@@ -303,7 +411,14 @@ function isNewer(remote, local) {
 // ΓöÇΓöÇ First-time setup ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 async function runFirstTimeSetup(logFn) {
-  if (!isWindows || !scriptsDir) return
+  if (!scriptsDir) return
+  // On non-Windows there is no PowerShell setup script — ensure password file
+  // exists via readPassword() (cross-platform) and skip the PS funnel setup.
+  if (!isWindows) {
+    try { readPassword() } catch {}
+    logFn("info", "first-time setup: POSIX platform, password ensured, funnel via tailscale CLI if installed")
+    return
+  }
 
   const setupScript = join(scriptsDir, "setup-opencode-shared.ps1")
   if (!existsSync(setupScript)) {
@@ -329,7 +444,8 @@ async function runFirstTimeSetup(logFn) {
 // ΓöÇΓöÇ Launch sidecar ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 async function ensureSidecarRunning(logFn) {
-  if (!isWindows || !scriptsDir) return { launched: false, pid: null }
+  // Cross-platform: Windows uses PowerShell launcher, POSIX spawns opencode directly.
+  // scriptsDir missing on POSIX is not fatal — we can still launch via PATH.
 
   const portOpen = await isPortListening(DEFAULT_PORT)
   if (portOpen) {
@@ -341,6 +457,35 @@ async function ensureSidecarRunning(logFn) {
   if (process.env.MOBILE_SYNC_DESKTOP_ONLY === "1") {
     logFn("info", "MOBILE_SYNC_DESKTOP_ONLY=1, not starting CLI fallback")
     return { launched: false, pid: null }
+  }
+
+  // POSIX: spawn `opencode serve` directly (no PowerShell)
+  if (!isWindows) {
+    const password = readPassword()
+    const cors = readCorsAllowlist()
+    logFn("info", "launching CLI server (POSIX direct spawn)...")
+    try {
+      const opencodeBin = "opencode"
+      const corsJson = cors
+      const child = spawn(opencodeBin, ["serve", "--hostname", "127.0.0.1", "--port", String(DEFAULT_PORT), `--cors=${corsJson}`], {
+        detached: true,
+        stdio: "ignore",
+        env: { ...process.env, OPENCODE_SERVER_PASSWORD: password, OPENCODE_SERVER_CORS: corsJson },
+      })
+      child.unref()
+      for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setTimeout(r, 500))
+        if (await isPortListening(DEFAULT_PORT)) {
+          logFn("info", `CLI server ready on port ${DEFAULT_PORT} (POSIX)`)
+          return { launched: true, pid: child.pid }
+        }
+      }
+      logFn("warn", `CLI server not listening after 15s on port ${DEFAULT_PORT}`)
+      return { launched: false, pid: child.pid }
+    } catch (err) {
+      logFn("error", "failed to launch CLI server (POSIX)", { error: errStr(err) })
+      return { launched: false, pid: null }
+    }
   }
 
   const launcher = join(scriptsDir, "start-opencode-server.ps1")
@@ -410,7 +555,7 @@ function startWatcher(logFn) {
 // duplicate fetches/downloads.
 let _updateInFlight = null
 
-async function checkForUpdates(logFn, osNotify) {
+async function checkForUpdates(logFn, notify) {
   if (!pluginDir || !scriptsDir) return
 
   // If an update check is already running, wait for its result instead of
@@ -420,12 +565,12 @@ async function checkForUpdates(logFn, osNotify) {
     return
   }
 
-  const work = _runUpdate(logFn, osNotify)
+  const work = _runUpdate(logFn, notify)
   _updateInFlight = work
   try { await work } finally { _updateInFlight = null }
 }
 
-async function _runUpdate(logFn, osNotify) {
+async function _runUpdate(logFn, notify) {
   try {
     const cache = loadCache()
     const headers = {
@@ -548,8 +693,8 @@ async function _runUpdate(logFn, osNotify) {
         }
 
         logFn("info", `self-updated to ${remoteVersion}. Restart OpenCode to load.`)
-        // .catch guards against unhandled rejection in the fire-and-forget toast.
-        osNotify("mobile-sync Updated", `Updated to v${remoteVersion}. Restart OpenCode to apply.`)
+        // Native TUI toast first, OS fallback — fire-and-forget with variant success
+        notify("mobile-sync Updated", `Updated to v${remoteVersion}. Restart OpenCode to apply.`, "success")
           .catch((err) => logFn("debug", "update toast failed", { error: errStr(err) }))
       }
     } finally {
@@ -592,7 +737,7 @@ async function copyFile(src, dest) {
 
 // ΓöÇΓöÇ Plugin Export ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
-const MobileSyncPlugin = async ({ $ }) => {
+const MobileSyncPlugin = async ({ client, $ }) => {
   // Allow disabling via env var (0/false/off = disabled)
   const enabled = (process.env.MOBILE_SYNC_ENABLED ?? "1").toLowerCase()
   if (["0", "false", "off"].includes(enabled)) {
@@ -623,7 +768,7 @@ const MobileSyncPlugin = async ({ $ }) => {
   let portWasDown = false   // true while port is known to be down (cooldown gates on this)
   const RELAUNCH_COOLDOWN_MS = 60_000  // don't relaunch more than once per minute while port is down
   let relaunching = false  // debounce guard for concurrent event-driven relaunch
-  const osNotify = createOsNotifier({ $ })
+  const notify = createNotifier({ client, $ })
 
   // Mask password: show last 4 chars so the user can still identify it.
   // Show the full value ONCE at startup ΓÇö this is the only time the user
@@ -639,7 +784,7 @@ const MobileSyncPlugin = async ({ $ }) => {
   updateTimer = setInterval(() => {
     if (Date.now() - lastUpdateCheckAt < UPDATE_CHECK_INTERVAL_MS) return
     lastUpdateCheckAt = Date.now()
-    checkForUpdates(logFn, osNotify).catch((err) => {
+    checkForUpdates(logFn, notify).catch((err) => {
       logFn("debug", "periodic update check failed", { error: errStr(err) })
     })
   }, UPDATE_CHECK_INTERVAL_MS)
@@ -709,7 +854,7 @@ const MobileSyncPlugin = async ({ $ }) => {
         watcherProc = startWatcher(logFn)
       }
 
-      await checkForUpdates(logFn, osNotify)
+      await checkForUpdates(logFn, notify)
       lastUpdateCheckAt = Date.now()
 
       logFn("info", `initialized (port ${port})`)
@@ -719,7 +864,7 @@ const MobileSyncPlugin = async ({ $ }) => {
       // .catch guards against unhandled rejection in the fire-and-forget timer.
       startupToastTimer = setTimeout(() => {
         startupToastTimer = null
-        osNotify("mobile-sync Ready", `v${MOBILE_SYNC_VERSION} active on port ${port}`)
+        notify("mobile-sync Ready", `v${MOBILE_SYNC_VERSION} active on port ${port}`, "success")
           .catch((err) => logFn("debug", "startup toast failed", { error: errStr(err) }))
       }, 5_000)
       if (startupToastTimer?.unref) startupToastTimer.unref()
@@ -751,6 +896,13 @@ const MobileSyncPlugin = async ({ $ }) => {
       }
       if (!output.env.OPENCODE_SERVER_PASSWORD) {
         output.env.OPENCODE_SERVER_PASSWORD = password
+      }
+      // Always set CORS allowlist from the funnel config (single source of truth:
+      // ~/.opencode-funnel-url, written by setup-opencode-shared.ps1). If unset
+      // the patched app.asar falls back to ["*"] for first-run compatibility.
+      // SECURITY: never let shell commands inject a different CORS policy.
+      if (!output.env.OPENCODE_SERVER_CORS) {
+        output.env.OPENCODE_SERVER_CORS = readCorsAllowlist()
       }
     },
 
@@ -797,7 +949,7 @@ const MobileSyncPlugin = async ({ $ }) => {
       }
     },
 
-    // Cleanup on unload.
+// Cleanup on unload.
     // The CLI server (opencode.exe serve) is intentionally LEFT RUNNING when
     // the plugin unloads: mobile clients connect to it independently of the
     // OpenCode desktop app, and killing it would disconnect them. Set
@@ -825,10 +977,10 @@ const MobileSyncPlugin = async ({ $ }) => {
       if (launcherPid) {
         const tree = process.env.MOBILE_SYNC_KILL_SERVER_ON_DISPOSE === "1"
         if (isWindows && tree) {
-          // /T = terminate child tree, /F = force. Ignore exit code ΓÇö the
-          // wrapper may have already exited and taskkill returns non-zero
-          // in that case, which is fine.
-          execFile("taskkill", ["/T", "/F", "/PID", String(launcherPid)], { windowsHide: true }, () => {})
+          // /T = terminate child tree, /F = force. Await to ensure cleanup completes.
+          await new Promise((resolve) => {
+            execFile("taskkill", ["/T", "/F", "/PID", String(launcherPid)], { windowsHide: true }, () => resolve())
+          })
         }
         launcherPid = null
       }

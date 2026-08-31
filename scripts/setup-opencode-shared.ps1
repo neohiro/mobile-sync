@@ -120,7 +120,7 @@ if (-not $exe) {
     Invoke-Step "Install OpenCode CLI" -Action {
         Write-Host "  opencode.exe not found. Installing..." -ForegroundColor Yellow
         try {
-            winget install SST.opencode --accept-source-agreements --accept-package-agreements 2>&1 | Out-Null
+            winget install SST.opencode --accept-source-agreements --accept-package-agreements
             if ($LASTEXITCODE -ne 0) { throw "winget install failed with code $LASTEXITCODE" }
         } catch {
             Write-Host "  Failed to install OpenCode: $($_.Exception.Message)" -ForegroundColor Red
@@ -267,14 +267,14 @@ if (Test-Path $tsPath) {
             } else {
                 Invoke-Step "Configure Tailscale Funnel" -Action {
                     Write-Host "  Setting up Funnel: $funnelUrl -> 127.0.0.1:4096" -ForegroundColor Cyan
-                    & $tsPath funnel 4096 2>&1
+                    & $tsPath funnel --bg 4096 2>&1
                     if ($LASTEXITCODE -ne 0) {
-                        Write-Host "  Funnel setup failed. Run manually: tailscale funnel 4096" -ForegroundColor Yellow
+                        Write-Host "  Funnel setup failed. Run manually: tailscale funnel --bg 4096" -ForegroundColor Yellow
                     } else {
                         Write-Host "  Funnel configured." -ForegroundColor Green
                     }
                 } -Preview {
-                    Write-Host "    Would run: tailscale funnel 4096" -ForegroundColor DarkGray
+                    Write-Host "    Would run: tailscale funnel --bg 4096" -ForegroundColor DarkGray
                     Write-Host "    Target: $funnelUrl -> 127.0.0.1:4096" -ForegroundColor DarkGray
                 }
             }
@@ -325,7 +325,7 @@ if ($autoStart -ne 'n') {
     if ($existingTask) {
         Write-Host "  Scheduled task already exists." -ForegroundColor Green
     } else {
-        $serverScript = "$PSScriptRoot\start-opencode-server.ps1"
+        $serverScript = "$PSScriptRoot\run-opencode-server-loop.ps1"
         if (Test-Path $serverScript) {
             Invoke-Step "Create scheduled task" -Action {
                 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
