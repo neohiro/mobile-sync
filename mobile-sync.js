@@ -184,7 +184,7 @@ function createOsNotifier({ $, systemRoot = process.env.SystemRoot } = {}) {
     const encoded = Buffer.from(windowsToastPs(title, message), "utf16le").toString("base64")
     await withTimeout($`${exe} -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand ${encoded}`.quiet())
   }
-  return async (title, message) => {
+  return async (title, message, _variant) => {
     try {
       if (!($ && typeof $ === "function")) return false
       if (isWindows) {
@@ -278,11 +278,13 @@ function runPSCommand(command, opts = {}) {
 /**
  * Check if a TCP port is listening on localhost (both IPv4 and IPv6).
  * Pure Node — no PowerShell overhead (8ms vs ~500ms).
- * Tries IPv4 (127.0.0.1) first, then IPv6 (::1). Returns true on the first
+ * Tries each host in order until one responds; returns true on the first
  * match. This handles sidecars that bind to either address.
+ * @param {number} port
+ * @param {string[]} [hosts] - Defaults to ["127.0.0.1", "::1"]
  */
-function isPortListening(port) {
-  const hosts = ["127.0.0.1", "::1"]
+function isPortListening(port, hosts = ["127.0.0.1", "::1"]) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return Promise.resolve(false)
   let idx = 0
 
   const tryNext = (resolve) => {
@@ -297,6 +299,104 @@ function isPortListening(port) {
   }
 
   return new Promise(tryNext)
+}
+
+// ━━━ Funnel health monitor ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/**
+ * Query `tailscale funnel status` and return true only when Funnel is on
+ * AND the proxy rule maps to the local port.  Parses the two-line ASCII
+ * output produced by `tailscale funnel status`:
+ *
+ *   # Funnel on:
+ *   #     - https://host.taildxxxx.ts.net
+ *   https://host.taildxxxx.ts.net (Funnel on)
+ *   |-- / proxy http://127.0.0.1:4096
+ *
+ * Returns null if the command fails (tailscale not installed, not connected,
+ * or permission denied) so callers can distinguish "off" from "unknown".
+ */
+async function isFunnelActive(logFn) {
+  const tsExe = isWindows ? "tailscale.exe" : "tailscale"
+  try {
+    const { stdout } = await new Promise((resolve, reject) => {
+      execFile(tsExe, ["funnel", "status"], {
+        windowsHide: true,
+        timeout: 10_000,
+        encoding: "utf8",
+      }, (err, stdout, stderr) => {
+        if (err) reject(err)
+        else resolve({ stdout: stdout || "", stderr: stderr || "" })
+      })
+    })
+    const lines = (stdout || "").split(/\r?\n/).map((l) => l.trim())
+    const funnelLineIdx = lines.findIndex(
+      (l) => l.startsWith("Funnel on") || l.includes("(Funnel on)")
+    )
+    if (funnelLineIdx < 0) return false
+    const proxyLine = lines.slice(funnelLineIdx + 1).find((l) => l.includes("proxy"))
+    if (!proxyLine) return false
+    const match = proxyLine.match(/proxy\s+https?:\/\/127\.0\.0\.1:(\d+)/) ||
+                  proxyLine.match(/proxy\s+https?:\/\/\[::1\]:(\d+)/)
+    if (!match) return false
+    return parseInt(match[1], 10) === DEFAULT_PORT
+  } catch {
+    return null
+  }
+}
+
+const FUNNEL_CHECK_INTERVAL_MS = 300_000 // 5 min
+
+/**
+ * Verify Tailscale Funnel is active for port 4096 and attempt to repair it
+ * if it has dropped.  Funnel can silently disable after machine reboots,
+ * suspend/resume, Tailscale updates, or network interface changes.
+ *
+ * Sets _funnelStatus once the result is known so the startup toast can
+ * read it without re-probing.
+ */
+let _funnelStatus = null // null=unknown, true=on, false=off
+async function checkFunnelHealth(logFn, osNotify) {
+  const status = await isFunnelActive(logFn)
+  _funnelStatus = status
+
+  if (status === null) {
+    logFn("debug", "funnel health: cannot query tailscale (not installed or not connected)")
+    return
+  }
+
+  if (status) {
+    logFn("debug", "funnel health: OK (Funnel active on port 4096)")
+    return
+  }
+
+  // Funnel is off — attempt auto-repair
+  logFn("warn", "funnel health: Funnel is OFF, attempting repair...")
+  const tsExe = isWindows ? "tailscale.exe" : "tailscale"
+  try {
+    await new Promise((resolve, reject) => {
+      execFile(tsExe, ["funnel", String(DEFAULT_PORT)], {
+        windowsHide: true,
+        timeout: 30_000,
+        encoding: "utf8",
+      }, (err, stdout, stderr) => {
+        if (err) reject(err)
+        else resolve({ stdout: stdout || "", stderr: stderr || "" })
+      })
+    })
+    const repaired = await isFunnelActive(logFn)
+    _funnelStatus = repaired
+    if (repaired) {
+      logFn("info", "funnel health: Funnel restored on port 4096")
+    } else {
+      logFn("error", "funnel health: repair failed — Funnel still off")
+      osNotify("mobile-sync: Funnel OFF", "Could not restore Funnel. Run: tailscale funnel 4096")
+        .catch(() => {})
+    }
+  } catch (err) {
+    _funnelStatus = false
+    logFn("error", "funnel health: repair command failed", { error: errStr(err) })
+  }
 }
 
 /** Semver comparison: returns true if remote > local. */
@@ -752,6 +852,20 @@ const MobileSyncPlugin = async ({ $ }) => {
     if (watchdogTimer.unref) watchdogTimer.unref()
   }
 
+  // ── Funnel health monitor ─────────────────────────────────────────────
+  // Tailscale Funnel can silently drop after reboot, suspend/resume, or
+  // network changes. Every 5 min we verify it's still routing to port 4096
+  // and auto-repair by running `tailscale funnel 4096` if not.
+  let funnelTimer = null
+  if (isWindows) {
+    funnelTimer = setInterval(() => {
+      checkFunnelHealth(logFn, osNotify).catch((err) =>
+        logFn("debug", "funnel health tick failed", { error: errStr(err) })
+      )
+    }, FUNNEL_CHECK_INTERVAL_MS)
+    if (funnelTimer.unref) funnelTimer.unref()
+  }
+
   // ΓöÇΓöÇ Deferred init: run heavy work AFTER returning hooks ΓöÇΓöÇ
   // This prevents the plugin from blocking OpenCode's GUI startup.
   // All errors are caught so a failure here never bricks the client.
@@ -774,17 +888,32 @@ const MobileSyncPlugin = async ({ $ }) => {
         watcherProc = startWatcher(logFn)
       }
 
+      // Verify and (if needed) repair Tailscale Funnel before reporting ready.
+      // This is the last step before the "Ready" toast so the toast reflects
+      // actual mobile-access availability, not just plugin load.
+      await checkFunnelHealth(logFn, osNotify)
+
       await checkForUpdates(logFn, osNotify)
       lastUpdateCheckAt = Date.now()
 
-      logFn("info", `initialized (port ${port})`)
+      const portStatus = portIsUp ? "up" : "down"
+      const funnelStatusText =
+        _funnelStatus === true ? "Funnel ON" :
+        _funnelStatus === false ? "Funnel OFF" :
+        "Funnel unknown"
+      logFn("info", `initialized (port ${port}: ${portStatus}, ${funnelStatusText})`)
 
-      // Delayed startup toast ΓÇö shows after GUI has loaded (5s).
+      // Delayed startup toast — shows after GUI has loaded (5s).
       // Tracked so dispose can cancel it if plugin unloads before it fires.
-      // .catch guards against unhandled rejection in the fire-and-forget timer.
+      // Body now reflects actual port + funnel state so the user knows
+      // whether mobile access is working without reading logs.
       startupToastTimer = setTimeout(() => {
         startupToastTimer = null
-        osNotify("mobile-sync Ready", `v${MOBILE_SYNC_VERSION} active on port ${port}`)
+        const variant = (_funnelStatus === true && portIsUp) ? "success" : "warning"
+        const body = _funnelStatus === true && portIsUp
+          ? `v${MOBILE_SYNC_VERSION} • port ${port} • Funnel active`
+          : `v${MOBILE_SYNC_VERSION} • port ${port}: ${portStatus} • ${funnelStatusText}`
+        osNotify("mobile-sync Ready", body, variant)
           .catch((err) => logFn("debug", "startup toast failed", { error: errStr(err) }))
       }, 5_000)
       if (startupToastTimer?.unref) startupToastTimer.unref()
@@ -882,6 +1011,10 @@ const MobileSyncPlugin = async ({ $ }) => {
       if (watchdogTimer) {
         clearInterval(watchdogTimer)
         watchdogTimer = null
+      }
+      if (funnelTimer) {
+        clearInterval(funnelTimer)
+        funnelTimer = null
       }
       if (startupToastTimer) {
         clearTimeout(startupToastTimer)
