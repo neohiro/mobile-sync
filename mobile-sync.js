@@ -261,22 +261,7 @@ function logFnOnce(level, msg, extra) {
 }
 let _globalLogFn = null
 
-/** Run a PowerShell script file and return a promise. */
-function runPS(scriptPath, args = [], opts = {}) {
-  return new Promise((resolve, reject) => {
-    const allArgs = [...PS_FLAGS, "-File", scriptPath, ...args]
-    execFile(PS_EXE, allArgs, {
-      windowsHide: true,
-      timeout: opts.timeout || 60_000,
-      encoding: "utf8",
-    }, (err, stdout, stderr) => {
-      if (err && !opts.allowFail) reject(err)
-      else resolve({ stdout: stdout || "", stderr: stderr || "", code: err?.code || 0 })
-    })
-  })
-}
-
-/** Run a PowerShell command string (not a file) and return a promise. */
+// Run a PowerShell command string (not a file) and return a promise.
 function runPSCommand(command, opts = {}) {
   return new Promise((resolve, reject) => {
     execFile(PS_EXE, [...PS_FLAGS, "-Command", command], {
@@ -734,15 +719,15 @@ const MobileSyncPlugin = async ({ $ }) => {
   const ensureServerHealthy = async () => {
     if (watchdogStarting) return
     if (Date.now() - lastWatchdogAt < WATCHDOG_INTERVAL_MS - 1_000) return
-    lastWatchdogAt = Date.now()
-    if (await isPortListening(port)) {
-      portWasDown = false
-      return
-    }
-    if (Date.now() - lastRelaunchAt < RELAUNCH_COOLDOWN_MS) return
     watchdogStarting = true
-    portWasDown = true
+    lastWatchdogAt = Date.now()
     try {
+      if (await isPortListening(port)) {
+        portWasDown = false
+        return
+      }
+      if (Date.now() - lastRelaunchAt < RELAUNCH_COOLDOWN_MS) return
+      portWasDown = true
       logFn("warn", "watchdog: port down, restarting server")
       lastRelaunchAt = Date.now()
       const result = await ensureSidecarRunning(logFn)
@@ -906,14 +891,16 @@ const MobileSyncPlugin = async ({ $ }) => {
         try { watcherProc.kill() } catch {}
         watcherProc = null
       }
-      // Best-effort: kill the wrapper that launched the sidecar. This is
-      // usually a no-op (the wrapper has already exited), but if MOBILE_SYNC_KILL_SERVER_ON_DISPOSE
-      // is set we also walk the process tree to terminate the opencode.exe grandchild.
+      // Best-effort: terminate the opencode serve process and its children.
+      // The CLI server is intentionally LEFT RUNNING when the plugin unloads:
+      // mobile clients connect to it independently of the OpenCode desktop app,
+      // and killing it would disconnect them. Set
+      // MOBILE_SYNC_KILL_SERVER_ON_DISPOSE=1 to override.
       if (launcherPid) {
         const tree = process.env.MOBILE_SYNC_KILL_SERVER_ON_DISPOSE === "1"
         if (isWindows && tree) {
-          // /T = terminate child tree, /F = force. Ignore exit code ΓÇö the
-          // wrapper may have already exited and taskkill returns non-zero
+          // /T = terminate child tree, /F = force. Ignore exit code — the
+          // process may have already exited and taskkill returns non-zero
           // in that case, which is fine.
           execFile("taskkill", ["/T", "/F", "/PID", String(launcherPid)], { windowsHide: true }, () => {})
         }
