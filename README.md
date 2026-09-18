@@ -301,3 +301,5 @@ The plugin file must be at the top level of `~/.config/opencode/plugins/` (not i
 ## License
 
 MIT
+
+[![Visitors](https://api.visitorbadge.io/api/visitors?path=github.com/neohiro/mobile-sync&label=Visitors&countColor=%23263759)](https://visitorbadge.io/status?path=github.com/neohiro/mobile-sync)
