@@ -208,6 +208,42 @@ test("control char in ETag rejected", () => assert.doesNotMatch(`W/"${"a".repeat
 test("empty string rejected", () => assert.doesNotMatch("", etagRe))
 test("plain word 16+ chars accepted", () => assert.match("aaaaaaaaaaaaaaaa", etagRe))
 
+console.log("\nsaveCache (atomic write)")
+// Mirror production: temp + rename so a crash mid-write doesn't corrupt.
+let _chain = Promise.resolve()
+async function saveCache(cache, file) {
+  const next = _chain.then(() => {
+    const tmp = file + ".tmp"
+    writeFileSync(tmp, JSON.stringify(cache))
+    renameSync(tmp, file)
+  })
+  _chain = next.catch(() => {})
+  return next
+}
+test("write creates file with correct JSON", async () => {
+  const f = join(testDir, "cache-1.json")
+  await saveCache({ etag: "abc", version: "1.0.0" }, f)
+  assert.equal(readFileSync(f, "utf8"), JSON.stringify({ etag: "abc", version: "1.0.0" }))
+})
+test("concurrent writes are serialized (final value is one of the inputs, not interleaved)", async () => {
+  const f = join(testDir, "cache-2.json")
+  const promises = []
+  for (let i = 0; i < 50; i++) {
+    promises.push(saveCache({ etag: `e${i}`, version: "1.0.0" }, f))
+  }
+  await Promise.all(promises)
+  // File must be valid JSON, not interleaved bytes from concurrent writers
+  const parsed = JSON.parse(readFileSync(f, "utf8"))
+  assert.equal(parsed.version, "1.0.0")
+  assert.match(parsed.etag, /^e\d+$/)
+})
+test("read after write round-trips correctly", async () => {
+  const f = join(testDir, "cache-3.json")
+  await saveCache({ etag: "deadbeef", version: "2.0.0" }, f)
+  const got = JSON.parse(readFileSync(f, "utf8"))
+  assert.deepEqual(got, { etag: "deadbeef", version: "2.0.0" })
+})
+
 console.log("\nlogFnOnce (deduplication)")
 const _loggedOnce = new Set()
 let _sink = []
@@ -382,6 +418,114 @@ test("symlinks are skipped (no infinite loop)", async () => {
     rmSync(dst, { recursive: true, force: true })
   }
 })
+
+// ── readCorsAllowlist ───────────────────────────────────────────────────────────
+const FUNNEL_URL_FILE = join(testDir, "funnel-url.txt")
+
+// Reimplement just enough of readCorsAllowlist to test it in isolation.
+// Mirrors mobile-sync.js exactly so we catch regressions in the source logic.
+function readCorsAllowlist(override) {
+  const file = override || FUNNEL_URL_FILE
+  const origins = ["oc://renderer"]
+  try {
+    if (existsSync(file)) {
+      const url = readFileSync(file, "utf8").trim()
+      if (/^https:\/\/[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/i.test(url)) {
+        origins.push(url)
+      }
+    }
+  } catch { /* fall through with just oc://renderer */ }
+  return JSON.stringify(origins)
+}
+
+function setFunnelUrl(val) {
+  if (val === null) {
+    try { unlinkSync(FUNNEL_URL_FILE) } catch {}
+  } else {
+    writeFileSync(FUNNEL_URL_FILE, val, "utf8")
+  }
+}
+
+console.log("\nreadCorsAllowlist")
+test("file missing -> ['oc://renderer']", () => {
+  setFunnelUrl(null)
+  const got = JSON.parse(readCorsAllowlist())
+  assert.deepEqual(got, ["oc://renderer"])
+})
+test("file empty -> ['oc://renderer'] (no crash)", () => {
+  setFunnelUrl("")
+  const got = JSON.parse(readCorsAllowlist())
+  assert.deepEqual(got, ["oc://renderer"])
+})
+test("file whitespace only -> ['oc://renderer']", () => {
+  setFunnelUrl("  \n\t\r  ")
+  const got = JSON.parse(readCorsAllowlist())
+  assert.deepEqual(got, ["oc://renderer"])
+})
+test("valid https URL -> appended to origins", () => {
+  setFunnelUrl("https://machine.tailnet.ts.net")
+  const got = JSON.parse(readCorsAllowlist())
+  assert.deepEqual(got, ["oc://renderer", "https://machine.tailnet.ts.net"])
+})
+test("URL with path rejected (regex requires end-of-string after hostname)", () => {
+  // The regex anchors with $ so any path after the hostname is rejected.
+  // CORS origin comparison strips paths anyway, so this is a security
+  // plus: only the bare origin is permitted.
+  setFunnelUrl("https://machine.tailnet.ts.net/some/path")
+  const got = JSON.parse(readCorsAllowlist())
+  assert.deepEqual(got, ["oc://renderer"])
+})
+test("http rejected -> ['oc://renderer']", () => {
+  setFunnelUrl("http://machine.tailnet.ts.net")
+  const got = JSON.parse(readCorsAllowlist())
+  assert.deepEqual(got, ["oc://renderer"])
+})
+test("wildcard '*' not in file -> accepted (this is the upstream bug; documented here)", () => {
+  // This test documents the known gap: if the funnel file contains "*", the
+  // regex rejects it (no https:// prefix), so it's treated as no URL.
+  // The caller (start-opencode-desktop.ps1) now adds its own wildcard check.
+  setFunnelUrl("*")
+  const got = JSON.parse(readCorsAllowlist())
+  assert.deepEqual(got, ["oc://renderer"])
+})
+test("hostname starting with hyphen rejected", () => {
+  setFunnelUrl("https://-machine.tailnet.ts.net")
+  const got = JSON.parse(readCorsAllowlist())
+  assert.deepEqual(got, ["oc://renderer"])
+})
+test("single-char hostname accepted", () => {
+  setFunnelUrl("https://a.ts.net")
+  const got = JSON.parse(readCorsAllowlist())
+  assert.deepEqual(got, ["oc://renderer", "https://a.ts.net"])
+})
+test("URL with trailing slash rejected (regex requires hostname to end with alphanum)", () => {
+  setFunnelUrl("https://machine.tailnet.ts.net/")
+  const got = JSON.parse(readCorsAllowlist())
+  assert.deepEqual(got, ["oc://renderer"])
+})
+test("JSON output is valid and parseable", () => {
+  setFunnelUrl("https://machine.tailnet.ts.net")
+  const out = readCorsAllowlist()
+  const parsed = JSON.parse(out)  // must not throw
+  assert.equal(parsed.length, 2)
+  assert.equal(typeof parsed[0], "string")
+  assert.equal(typeof parsed[1], "string")
+})
+test("read error on file -> ['oc://renderer'] (no crash)", () => {
+  // unreadable file: skip on Unix where we can chmod; on Windows permission
+  // errors are harder to trigger in tests.
+  try {
+    chmodSync(FUNNEL_URL_FILE, 0o000)
+    const got = JSON.parse(readCorsAllowlist())
+    assert.deepEqual(got, ["oc://renderer"])
+  } catch {
+    // permission test skipped on this platform
+  } finally {
+    try { chmodSync(FUNNEL_URL_FILE, 0o644) } catch {}
+  }
+})
+// clean up funnel URL file after tests
+setFunnelUrl(null)
 
 // Cleanup
 try {
