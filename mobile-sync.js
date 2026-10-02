@@ -3,9 +3,6 @@
  *
  * Makes the desktop sidecar (or CLI server as fallback) act as a shared server
  * on port 4096, accessible via Tailscale Funnel for mobile sync.
- * Works cross-platform (Windows, macOS, Linux) and with every OpenCode client
- * (desktop, TUI, web, CLI headless) — native in-app toast via
- * client.tui.showToast() with OS notification fallback.
  *
  * On startup:
  *   1. Runs first-time setup if needed (password file, patch, funnel)
@@ -26,15 +23,15 @@
  *                                  stay connected.
  */
 
-import { execFile, spawn } from "node:child_process"
+import { execFile, execFileSync, spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { readFile, writeFile, mkdir, rm, readdir, rename } from "node:fs/promises"
-import { readFileSync, writeFileSync, existsSync, renameSync, unlinkSync } from "node:fs"
+import { readFileSync, writeFileSync, existsSync, renameSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { homedir, platform, tmpdir } from "node:os"
 import { createConnection } from "node:net"
 
-const MOBILE_SYNC_VERSION = "1.1.2"
+const MOBILE_SYNC_VERSION = "1.0.2"
 const GITHUB_REPO = "neohiro/mobile-sync"
 const UPDATE_CHECK_INTERVAL_MS = 3_600_000 // hourly
 const DEFAULT_PORT = 4096
@@ -63,16 +60,8 @@ function loadCache() {
 }
 function saveCache(cache) {
   // Serialize writes so two concurrent updaters can't interleave JSON bytes.
-  // Use atomic write via temp file + rename.
   const next = _cacheWriteChain.then(() => {
-    const tmpPath = CACHE_FILE + ".tmp"
-    try {
-      writeFileSync(tmpPath, JSON.stringify(cache))
-      renameSync(tmpPath, CACHE_FILE)
-    } catch (err) {
-      // Log but don't throw — cache is best-effort
-      logFnOnce("debug", "cache write failed", { error: errStr(err) })
-    }
+    try { writeFileSync(CACHE_FILE, JSON.stringify(cache)) } catch {}
   })
   // Swallow rejections on the chain itself so one bad write doesn't poison
   // subsequent saves. The .then handler already catches its own write errors.
@@ -88,7 +77,6 @@ const PS_EXE = "powershell.exe"
 const PS_FLAGS = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive"]
 
 const PASSWORD_FILE = join(homedir(), ".opencode-server-password")
-const DIRECTORY_FILE = join(homedir(), ".opencode-server-directory")
 const FUNNEL_URL_FILE = join(homedir(), ".opencode-funnel-url")
 /**
  * Read the saved CORS allowlist for the desktop sidecar from
@@ -183,9 +171,6 @@ try {
   } catch { exit 1 }
 }`
 
-// Shell-escape for POSIX sh -c strings (single-quote wrap)
-const shQuote = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'"
-
 const NOTIFIER_TIMEOUT_MS = 15_000
 function createOsNotifier({ $, systemRoot = process.env.SystemRoot } = {}) {
   const withTimeout = (p) =>
@@ -199,88 +184,15 @@ function createOsNotifier({ $, systemRoot = process.env.SystemRoot } = {}) {
     const encoded = Buffer.from(windowsToastPs(title, message), "utf16le").toString("base64")
     await withTimeout($`${exe} -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand ${encoded}`.quiet())
   }
-  return async (title, message) => {
+  return async (title, message, _variant) => {
     try {
+      if (!($ && typeof $ === "function")) return false
       if (isWindows) {
-        if (!($ && typeof $ === "function")) return false
         await runPowerShellToast(
           `${systemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
           title, message)
         return true
       }
-      if (platform() === "darwin") {
-        // AppleScript strings are double-quoted; escape backslash and double-quote.
-        const esc = (s) => String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"')
-        const script = `display notification "${esc(message)}" with title "${esc(title)}"`
-        await withTimeout(new Promise((resolve, reject) => {
-          execFile("osascript", ["-e", script], { timeout: NOTIFIER_TIMEOUT_MS }, (err) => err ? reject(err) : resolve())
-        }))
-        return true
-      }
-      if (platform() === "linux") {
-        const tryExec = (cmd, args) => new Promise((resolve, reject) => {
-          execFile(cmd, args, { timeout: NOTIFIER_TIMEOUT_MS }, (err) => err ? reject(err) : resolve())
-        })
-        try {
-          await withTimeout(tryExec("notify-send", [title, message, "--icon=dialog-information", "--expire-time=10000"]))
-          return true
-        } catch {}
-        try {
-          await withTimeout(tryExec("kdialog", ["--passivepopup", `${title}: ${message}`, "10"]))
-          return true
-        } catch {}
-        try {
-          await withTimeout(tryExec("zenity", ["--notification", `--text=${title}: ${message}`]))
-          return true
-        } catch {}
-        return false
-      }
-    } catch { return false }
-    return false
-  }
-}
-
-// ── Unified notifier: native TUI toast first, OS fallback ────────────────────
-// Tries client.tui.showToast({ body: { title, message, variant, duration } }).
-// If the TUI is unavailable (headless serve, older server, no client) or the
-// call throws/returns falsy, falls back to the OS notifier. Returns true if
-// either path succeeded so callers can distinguish delivered vs lost.
-function createNotifier({ client, $ } = {}) {
-  const osNotify = createOsNotifier({ $ })
-  const variantMap = (v) => {
-    const s = String(v ?? "info").toLowerCase()
-    return ["info", "success", "warning", "error"].includes(s) ? s : "info"
-  }
-  const clamp = (s, n) => {
-    const str = String(s ?? "")
-    return str.length > n ? str.slice(0, n - 1) + "\u2026" : str
-  }
-  return async (title, message, variant = "info") => {
-    const t = clamp(title, 120)
-    const m = clamp(message, 300)
-    const v = variantMap(variant)
-    if (client?.tui?.showToast && typeof client.tui.showToast === "function") {
-      const tryNative = async (body) => {
-        // Guard against hanging TUI (headless serve) — 4s timeout
-        const p = client.tui.showToast({ body })
-        const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("toast timeout")), 4000))
-        const res = await Promise.race([p, timeout])
-        if (res === false) throw new Error("native toast returned false")
-        return true
-      }
-      try {
-        await tryNative({ title: t, message: m, variant: v, duration: 5000 })
-        return true
-      } catch {
-        try {
-          await tryNative({ message: t ? `${t}: ${m}` : m, variant: v, duration: 5000 })
-          return true
-        } catch {}
-      }
-    }
-    try {
-      const ok = await osNotify(t, m)
-      return !!ok
     } catch { return false }
   }
 }
@@ -332,28 +244,6 @@ function readPassword() {
     }
     return generated
   }
-  // Validate password format (base64url, ~24 chars). If invalid, atomically
-  // overwrite the corrupted file and return a fresh secret instead of recursing
-  // (recursion would re-read the same bad file forever).
-  if (!/^[A-Za-z0-9_-]{20,}$/.test(raw)) {
-    logFnOnce("warn", "password file contains invalid format, regenerating", { path: PASSWORD_FILE })
-    const generated = generatePassword()
-    const tmpPath = PASSWORD_FILE + ".tmp"
-    try {
-      writeFileSync(tmpPath, generated + "\n", { mode: 0o600 })
-      try {
-        renameSync(tmpPath, PASSWORD_FILE)
-      } catch {
-        // Windows: target exists — overwrite in place
-        try { writeFileSync(PASSWORD_FILE, generated + "\n", { mode: 0o600 }) } catch {}
-        try { unlinkSync(tmpPath) } catch {}
-      }
-    } catch (err) {
-      logFnOnce("warn", "could not persist regenerated password; using ephemeral one", { error: errStr(err) })
-      return generated
-    }
-    return generated
-  }
   return raw
 }
 
@@ -371,11 +261,10 @@ function logFnOnce(level, msg, extra) {
 }
 let _globalLogFn = null
 
-/** Run a PowerShell script file and return a promise. */
-function runPS(scriptPath, args = [], opts = {}) {
+// Run a PowerShell command string (not a file) and return a promise.
+function runPSCommand(command, opts = {}) {
   return new Promise((resolve, reject) => {
-    const allArgs = [...PS_FLAGS, "-File", scriptPath, ...args]
-    execFile(PS_EXE, allArgs, {
+    execFile(PS_EXE, [...PS_FLAGS, "-Command", command], {
       windowsHide: true,
       timeout: opts.timeout || 60_000,
       encoding: "utf8",
@@ -386,50 +275,128 @@ function runPS(scriptPath, args = [], opts = {}) {
   })
 }
 
-/** Run a PowerShell command string (not a file) and return a promise. */
-function runPSCommand(command, opts = {}) {
-  return new Promise((resolve, reject) => {
-    const timeout = opts.timeout || 60_000
-    const child = execFile(PS_EXE, [...PS_FLAGS, "-Command", command], {
-      windowsHide: true,
-      timeout,
-      encoding: "utf8",
-    }, (err, stdout, stderr) => {
-      if (err && !opts.allowFail) reject(err)
-      else resolve({ stdout: stdout || "", stderr: stderr || "", code: err?.code || 0 })
-    })
-    // Handle process killed by timeout
-    child.on("error", (e) => {
-      if (e.code === "ETIMEDOUT" || e.signal === "SIGTERM") {
-        reject(new Error(`PowerShell command timed out after ${timeout}ms`))
-      }
-    })
-  })
+/**
+ * Check if a TCP port is listening on localhost (both IPv4 and IPv6).
+ * Pure Node — no PowerShell overhead (8ms vs ~500ms).
+ * Tries each host in order until one responds; returns true on the first
+ * match. This handles sidecars that bind to either address.
+ * @param {number} port
+ * @param {string[]} [hosts] - Defaults to ["127.0.0.1", "::1"]
+ */
+function isPortListening(port, hosts = ["127.0.0.1", "::1"]) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return Promise.resolve(false)
+  let idx = 0
+
+  const tryNext = (resolve) => {
+    if (idx >= hosts.length) { resolve(false); return }
+    const host = hosts[idx++]
+    const socket = createConnection({ host, port })
+    socket.setTimeout(2_000)
+    const cleanup = () => { socket.removeAllListeners(); socket.destroy() }
+    socket.once("connect", () => { cleanup(); resolve(true) })
+    socket.once("timeout", () => { cleanup(); tryNext(resolve) })
+    socket.once("error", () => { cleanup(); tryNext(resolve) })
+  }
+
+  return new Promise(tryNext)
 }
 
+// ━━━ Funnel health monitor ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 /**
- * Check if a TCP port is listening on localhost (IPv4 only).
- * Pure Node ΓÇö no PowerShell overhead (8ms vs ~500ms).
- * family: 4 is intentional: the opencode sidecar/CLI binds to 127.0.0.1.
- * If a future version binds to IPv6 (::1), this will false-negative ΓÇö
- * update family to 0 (dual-stack) and host to "localhost".
+ * Query `tailscale funnel status` and return true only when Funnel is on
+ * AND the proxy rule maps to the local port.  Parses the two-line ASCII
+ * output produced by `tailscale funnel status`:
+ *
+ *   # Funnel on:
+ *   #     - https://host.taildxxxx.ts.net
+ *   https://host.taildxxxx.ts.net (Funnel on)
+ *   |-- / proxy http://127.0.0.1:4096
+ *
+ * Returns null if the command fails (tailscale not installed, not connected,
+ * or permission denied) so callers can distinguish "off" from "unknown".
  */
-function isPortListening(port) {
-  return new Promise((resolve) => {
-    const socket = createConnection({ host: "127.0.0.1", port, family: 4 })
-    socket.setTimeout(2_000)
-    let resolved = false
-    const done = (result) => {
-      if (resolved) return
-      resolved = true
-      socket.removeAllListeners()
-      socket.destroy()
-      resolve(result)
+async function isFunnelActive(logFn) {
+  const tsExe = isWindows ? "tailscale.exe" : "tailscale"
+  try {
+    const { stdout } = await new Promise((resolve, reject) => {
+      execFile(tsExe, ["funnel", "status"], {
+        windowsHide: true,
+        timeout: 10_000,
+        encoding: "utf8",
+      }, (err, stdout, stderr) => {
+        if (err) reject(err)
+        else resolve({ stdout: stdout || "", stderr: stderr || "" })
+      })
+    })
+    const lines = (stdout || "").split(/\r?\n/).map((l) => l.trim())
+    const funnelLineIdx = lines.findIndex(
+      (l) => l.startsWith("Funnel on") || l.includes("(Funnel on)")
+    )
+    if (funnelLineIdx < 0) return false
+    const proxyLine = lines.slice(funnelLineIdx + 1).find((l) => l.includes("proxy"))
+    if (!proxyLine) return false
+    const match = proxyLine.match(/proxy\s+https?:\/\/127\.0\.0\.1:(\d+)/) ||
+                  proxyLine.match(/proxy\s+https?:\/\/\[::1\]:(\d+)/)
+    if (!match) return false
+    return parseInt(match[1], 10) === DEFAULT_PORT
+  } catch {
+    return null
+  }
+}
+
+const FUNNEL_CHECK_INTERVAL_MS = 300_000 // 5 min
+
+/**
+ * Verify Tailscale Funnel is active for port 4096 and attempt to repair it
+ * if it has dropped.  Funnel can silently disable after machine reboots,
+ * suspend/resume, Tailscale updates, or network interface changes.
+ *
+ * Sets _funnelStatus once the result is known so the startup toast can
+ * read it without re-probing.
+ */
+let _funnelStatus = null // null=unknown, true=on, false=off
+async function checkFunnelHealth(logFn, osNotify) {
+  const status = await isFunnelActive(logFn)
+  _funnelStatus = status
+
+  if (status === null) {
+    logFn("debug", "funnel health: cannot query tailscale (not installed or not connected)")
+    return
+  }
+
+  if (status) {
+    logFn("debug", "funnel health: OK (Funnel active on port 4096)")
+    return
+  }
+
+  // Funnel is off — attempt auto-repair
+  logFn("warn", "funnel health: Funnel is OFF, attempting repair...")
+  const tsExe = isWindows ? "tailscale.exe" : "tailscale"
+  try {
+    await new Promise((resolve, reject) => {
+      execFile(tsExe, ["funnel", String(DEFAULT_PORT)], {
+        windowsHide: true,
+        timeout: 30_000,
+        encoding: "utf8",
+      }, (err, stdout, stderr) => {
+        if (err) reject(err)
+        else resolve({ stdout: stdout || "", stderr: stderr || "" })
+      })
+    })
+    const repaired = await isFunnelActive(logFn)
+    _funnelStatus = repaired
+    if (repaired) {
+      logFn("info", "funnel health: Funnel restored on port 4096")
+    } else {
+      logFn("error", "funnel health: repair failed — Funnel still off")
+      osNotify("mobile-sync: Funnel OFF", "Could not restore Funnel. Run: tailscale funnel 4096")
+        .catch(() => {})
     }
-    socket.once("connect", () => done(true))
-    socket.once("timeout", () => done(false))
-    socket.once("error", () => done(false))
-  })
+  } catch (err) {
+    _funnelStatus = false
+    logFn("error", "funnel health: repair command failed", { error: errStr(err) })
+  }
 }
 
 /** Semver comparison: returns true if remote > local. */
@@ -445,14 +412,7 @@ function isNewer(remote, local) {
 // ΓöÇΓöÇ First-time setup ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
 async function runFirstTimeSetup(logFn) {
-  if (!scriptsDir) return
-  // On non-Windows there is no PowerShell setup script — ensure password file
-  // exists via readPassword() (cross-platform) and skip the PS funnel setup.
-  if (!isWindows) {
-    try { readPassword() } catch {}
-    logFn("info", "first-time setup: POSIX platform, password ensured, funnel via tailscale CLI if installed")
-    return
-  }
+  if (!isWindows || !scriptsDir) return
 
   const setupScript = join(scriptsDir, "setup-opencode-shared.ps1")
   if (!existsSync(setupScript)) {
@@ -477,9 +437,75 @@ async function runFirstTimeSetup(logFn) {
 
 // ΓöÇΓöÇ Launch sidecar ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
+// ΓöÇΓöÇ Find opencode executable (cached; survives across plugin restarts) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+
+const OPENCODE_EXE_CACHE_FILE = join(homedir(), ".opencode-mobile-sync-exe.json")
+
+function loadExeCache() {
+  try {
+    const raw = readFileSync(OPENCODE_EXE_CACHE_FILE, "utf8").trim()
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      try { writeFileSync(OPENCODE_EXE_CACHE_FILE, "{}") } catch {}
+      return {}
+    }
+    return parsed
+  } catch {
+    try { writeFileSync(OPENCODE_EXE_CACHE_FILE, "{}") } catch {}
+    return {}
+  }
+}
+
+function saveExeCache(cache) {
+  try { writeFileSync(OPENCODE_EXE_CACHE_FILE, JSON.stringify(cache)) } catch {}
+}
+
+/**
+ * Locate the opencode executable on the user's system. Caches the result so
+ * repeated plugin reloads don't rescan the disk. The cache key is the
+ * `MOBILE_SYNC_VERSION`; if the plugin self-updates, the cache is refreshed.
+ */
+function findOpencodeExe(logFn) {
+  const cache = loadExeCache()
+  const cached = cache[MOBILE_SYNC_VERSION]
+  if (cached && existsSync(cached)) return cached
+
+  const candidates = isWindows
+    ? [
+        join(process.env.LOCALAPPDATA ?? "", "opencode", "opencode.exe"),
+        join(process.env.PROGRAMFILES ?? "", "opencode", "opencode.exe"),
+        join(process.env["ProgramFiles(x86)"] ?? "", "opencode", "opencode.exe"),
+        join(homedir(), "AppData", "Local", "opencode", "opencode.exe"),
+        join(homedir(), "AppData", "Roaming", "opencode", "opencode.exe"),
+        "opencode.exe",
+      ]
+    : [
+        join(homedir(), ".local", "bin", "opencode"),
+        join(homedir(), ".local", "share", "opencode", "bin", "opencode"),
+        "/usr/local/bin/opencode",
+        "/usr/bin/opencode",
+        "opencode",
+      ]
+
+  for (const p of candidates) {
+    if (!p) continue
+    try { if (existsSync(p)) { saveExeCache({ [MOBILE_SYNC_VERSION]: p }); return p } } catch {}
+  }
+
+  const whichName = isWindows ? "opencode.exe" : "opencode"
+  const whichCmd = isWindows ? "where" : "which"
+  try {
+    const out = execFileSync(whichCmd, [whichName], { encoding: "utf8", timeout: 10_000, windowsHide: true })
+    const found = out.trim().split(/\r?\n/)[0]?.trim()
+    if (found) { saveExeCache({ [MOBILE_SYNC_VERSION]: found }); return found }
+  } catch {}
+
+  return whichName
+}
+
 async function ensureSidecarRunning(logFn) {
-  // Cross-platform: Windows uses PowerShell launcher, POSIX spawns opencode directly.
-  // scriptsDir missing on POSIX is not fatal — we can still launch via PATH.
+  if (!isWindows) return { launched: false, pid: null }
 
   const portOpen = await isPortListening(DEFAULT_PORT)
   if (portOpen) {
@@ -487,74 +513,33 @@ async function ensureSidecarRunning(logFn) {
     return { launched: false, pid: null }
   }
 
-  // CLI fallback: skip if MOBILE_SYNC_DESKTOP_ONLY is set
   if (process.env.MOBILE_SYNC_DESKTOP_ONLY === "1") {
     logFn("info", "MOBILE_SYNC_DESKTOP_ONLY=1, not starting CLI fallback")
     return { launched: false, pid: null }
   }
 
-  // POSIX: spawn `opencode serve` directly (no PowerShell)
-  if (!isWindows) {
-    const password = readPassword()
-    const cors = readCorsAllowlist()
-    logFn("info", "launching CLI server (POSIX direct spawn)...")
-    try {
-      const opencodeBin = "opencode"
-      const corsJson = cors
-      const child = spawn(opencodeBin, ["serve", "--hostname", "127.0.0.1", "--port", String(DEFAULT_PORT), `--cors=${corsJson}`], {
-        detached: true,
-        stdio: "ignore",
-        env: { ...process.env, OPENCODE_SERVER_PASSWORD: password, OPENCODE_SERVER_CORS: corsJson },
-      })
-      child.unref()
-      for (let i = 0; i < 30; i++) {
-        await new Promise((r) => setTimeout(r, 500))
-        if (await isPortListening(DEFAULT_PORT)) {
-          logFn("info", `CLI server ready on port ${DEFAULT_PORT} (POSIX)`)
-          return { launched: true, pid: child.pid }
-        }
-      }
-      logFn("warn", `CLI server not listening after 15s on port ${DEFAULT_PORT}`)
-      return { launched: false, pid: child.pid }
-    } catch (err) {
-      logFn("error", "failed to launch CLI server (POSIX)", { error: errStr(err) })
-      return { launched: false, pid: null }
-    }
-  }
+  const exe = findOpencodeExe(logFn)
+  logFn("debug", `spawning: ${exe} serve --port ${DEFAULT_PORT}`)
 
-  if (!scriptsDir) {
-    logFn("warn", "scriptsDir not resolved, cannot launch Windows server wrapper")
-    return { launched: false, pid: null }
-  }
-  const launcher = join(scriptsDir, "start-opencode-server.ps1")
-  if (!existsSync(launcher)) {
-    logFn("warn", "server launcher not found", { path: launcher })
-    return { launched: false, pid: null }
-  }
-
-  logFn("info", "launching CLI server (desktop not running)...")
   try {
-    // Launch detached (non-blocking). Node's detached: true handles process
-    // survival ΓÇö do NOT also pass -Detached to the script (conflicts).
-    const child = spawn(PS_EXE, [...PS_FLAGS, "-File", launcher, "-Detached"], {
+    const child = spawn(exe, ["serve", "--port", String(DEFAULT_PORT)], {
       windowsHide: true,
       detached: true,
       stdio: "ignore",
     })
     child.unref()
 
-    // Wait up to 15s for port to open
     for (let i = 0; i < 30; i++) {
       await new Promise((r) => setTimeout(r, 500))
       if (await isPortListening(DEFAULT_PORT)) {
-        logFn("info", `CLI server ready on port ${DEFAULT_PORT}`)
+        logFn("info", `opencode serve ready on port ${DEFAULT_PORT}`)
         return { launched: true, pid: child.pid }
       }
     }
-    logFn("warn", `CLI server not listening after 15s on port ${DEFAULT_PORT}`)
+    logFn("warn", `opencode serve not listening after 15s on port ${DEFAULT_PORT}`)
     return { launched: false, pid: child.pid }
   } catch (err) {
-    logFn("error", "failed to launch CLI server", { error: errStr(err) })
+    logFn("error", "failed to launch opencode serve", { error: errStr(err) })
     return { launched: false, pid: null }
   }
 }
@@ -593,32 +578,27 @@ function startWatcher(logFn) {
 // duplicate fetches/downloads.
 let _updateInFlight = null
 
-async function checkForUpdates(logFn, notify) {
-  if (!pluginDir || !scriptsDir) return
+async function checkForUpdates(logFn, osNotify) {
+  if (!pluginDir) return
 
-  // If an update check is already running, wait for its result instead of
-  // starting a second concurrent fetch (which would double bandwidth and race writes).
   if (_updateInFlight) {
     try { await _updateInFlight } catch {}
     return
   }
 
-  const work = _runUpdate(logFn, notify)
+  const work = _runUpdate(logFn, osNotify)
   _updateInFlight = work
   try { await work } finally { _updateInFlight = null }
 }
 
-async function _runUpdate(logFn, notify) {
+async function _runUpdate(logFn, osNotify) {
   try {
     const cache = loadCache()
     const headers = {
       "user-agent": `mobile-sync-plugin/${MOBILE_SYNC_VERSION}`,
       accept: "application/vnd.github.v3+json",
     }
-    // Validate ETag before sending as header ΓÇö guards against malformed cache
-    // file. GitHub ETags are weak (`W/"hex"`) or strong (`"hex"`) with a 64-char
-    // hex digest. Allowed chars: word chars, slash, dash, quote; 16-80 length.
-    if (typeof cache.etag === "string" && /^[\w"/-]{16,80}$/.test(cache.etag)) {
+    if (typeof cache.etag === "string" && /^[\w"\/-]{16,80}$/.test(cache.etag)) {
       headers["if-none-match"] = cache.etag
     }
 
@@ -632,7 +612,7 @@ async function _runUpdate(logFn, notify) {
       return
     }
     if (!res.ok) {
-      logFn("debug", `GitHub API returned ${res.status}`, { status: res.status })
+      logFn("warn", `GitHub API returned ${res.status}`, { status: res.status })
       return
     }
 
@@ -659,7 +639,10 @@ async function _runUpdate(logFn, notify) {
       },
       signal: AbortSignal.timeout(60_000),
     })
-    if (!zipRes.ok) return
+    if (!zipRes.ok) {
+      logFn("warn", `zipball download failed: ${zipRes.status}`)
+      return
+    }
     const zipBytes = Buffer.from(await zipRes.arrayBuffer())
 
     const tempDir = join(tmpdir(), `mobile-sync-update-${Date.now()}`)
@@ -670,26 +653,21 @@ async function _runUpdate(logFn, notify) {
 
       if (isWindows) {
         const extractDir = join(tempDir, "extracted")
-        // Use psQuote (PowerShell single-quote escape) for defense-in-depth.
-        // Paths here come from Date.now()/tmpdir() (safe today) but this guards
-        // against any future path containing a single quote.
         await runPSCommand(
           `Expand-Archive -Path ${psQuote(zipPath)} -DestinationPath ${psQuote(extractDir)} -Force`,
           { timeout: 30_000 }
         )
 
         const entries = await readdir(extractDir)
-        if (entries.length === 0) return
+        if (entries.length === 0) {
+          logFn("warn", "update zipball extracted to empty directory")
+          return
+        }
         const srcDir = join(extractDir, entries[0])
 
         const scriptsSrc = join(srcDir, "scripts")
+        const scriptsDest = join(pluginDir, "mobile-sync-scripts")
         if (existsSync(scriptsSrc)) {
-          const scriptsDest = scriptsDir
-          // Try to remove the existing scripts directory first. This can fail on
-          // Windows if a running PowerShell process (e.g. the CLI server) has one
-          // of the scripts open with an exclusive lock. In that case we fall back
-          // to a per-file copy (files that were removed in the new release will
-          // persist as orphans ΓÇö acceptable; new/updated files are still deployed).
           try {
             await rm(scriptsDest, { recursive: true, force: true })
           } catch (rmErr) {
@@ -705,8 +683,6 @@ async function _runUpdate(logFn, notify) {
           try {
             await rename(pluginDest, backup)
           } catch (renameErr) {
-            // File may be locked (still loaded by host). Log and abort update ΓÇö
-            // overwriting without a backup would brick the plugin permanently.
             logFn("warn", "could not back up plugin file, skipping update", {
               error: errStr(renameErr),
               hint: "plugin may be loaded by host; restart and retry",
@@ -716,12 +692,9 @@ async function _runUpdate(logFn, notify) {
           try {
             await copyFile(pluginSrc, pluginDest)
           } catch (copyErr) {
-            // Restore the previous version so the next load still works.
             await rename(backup, pluginDest).catch(() => {})
             throw copyErr
           }
-          // Successful update ΓÇö remove the backup to avoid accumulating
-          // stale .bak files across many updates.
           await rm(backup, { force: true }).catch(() => {})
         }
 
@@ -731,15 +704,20 @@ async function _runUpdate(logFn, notify) {
         }
 
         logFn("info", `self-updated to ${remoteVersion}. Restart OpenCode to load.`)
-        // Native TUI toast first, OS fallback — fire-and-forget with variant success
-        notify("mobile-sync Updated", `Updated to v${remoteVersion}. Restart OpenCode to apply.`, "success")
+        osNotify("mobile-sync Updated", `Updated to v${remoteVersion}. Restart OpenCode to apply.`)
           .catch((err) => logFn("debug", "update toast failed", { error: errStr(err) }))
       }
     } finally {
       await rm(tempDir, { recursive: true, force: true }).catch(() => {})
     }
   } catch (err) {
-    logFn("debug", "update check skipped", { error: errStr(err) })
+    const msg = errStr(err)
+    const transient = /\b(timeout|ECONNREFUSED|ENOTFOUND|ENETUNREACH|ETIMEDOUT|fetch failed|network|SSL|rate limit)\b/i.test(msg)
+    if (transient) {
+      logFn("debug", "update check failed (transient)", { error: msg })
+    } else {
+      logFn("error", "update check failed", { error: msg })
+    }
   }
 }
 
@@ -775,7 +753,7 @@ async function copyFile(src, dest) {
 
 // ΓöÇΓöÇ Plugin Export ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
-const MobileSyncPlugin = async ({ client, $ }) => {
+const MobileSyncPlugin = async ({ $ }) => {
   // Allow disabling via env var (0/false/off = disabled)
   const enabled = (process.env.MOBILE_SYNC_ENABLED ?? "1").toLowerCase()
   if (["0", "false", "off"].includes(enabled)) {
@@ -806,7 +784,7 @@ const MobileSyncPlugin = async ({ client, $ }) => {
   let portWasDown = false   // true while port is known to be down (cooldown gates on this)
   const RELAUNCH_COOLDOWN_MS = 60_000  // don't relaunch more than once per minute while port is down
   let relaunching = false  // debounce guard for concurrent event-driven relaunch
-  const notify = createNotifier({ client, $ })
+  const osNotify = createOsNotifier({ $ })
 
   // Mask password: show last 4 chars so the user can still identify it.
   // Show the full value ONCE at startup ΓÇö this is the only time the user
@@ -822,7 +800,7 @@ const MobileSyncPlugin = async ({ client, $ }) => {
   updateTimer = setInterval(() => {
     if (Date.now() - lastUpdateCheckAt < UPDATE_CHECK_INTERVAL_MS) return
     lastUpdateCheckAt = Date.now()
-    checkForUpdates(logFn, notify).catch((err) => {
+    checkForUpdates(logFn, osNotify).catch((err) => {
       logFn("debug", "periodic update check failed", { error: errStr(err) })
     })
   }, UPDATE_CHECK_INTERVAL_MS)
@@ -841,17 +819,17 @@ const MobileSyncPlugin = async ({ client, $ }) => {
   const ensureServerHealthy = async () => {
     if (watchdogStarting) return
     if (Date.now() - lastWatchdogAt < WATCHDOG_INTERVAL_MS - 1_000) return
-    lastWatchdogAt = Date.now()
-    if (await isPortListening(port)) {
-      portWasDown = false
-      return
-    }
-    if (Date.now() - lastRelaunchAt < RELAUNCH_COOLDOWN_MS) return
     watchdogStarting = true
-    lastRelaunchAt = Date.now()
-    portWasDown = true
+    lastWatchdogAt = Date.now()
     try {
+      if (await isPortListening(port)) {
+        portWasDown = false
+        return
+      }
+      if (Date.now() - lastRelaunchAt < RELAUNCH_COOLDOWN_MS) return
+      portWasDown = true
       logFn("warn", "watchdog: port down, restarting server")
+      lastRelaunchAt = Date.now()
       const result = await ensureSidecarRunning(logFn)
       if (result.pid) launcherPid = result.pid
       if (await isPortListening(port)) {
@@ -864,14 +842,29 @@ const MobileSyncPlugin = async ({ client, $ }) => {
       watchdogStarting = false
     }
   }
-  // Watchdog runs on all platforms — POSIX now spawns opencode directly, so it
-  // needs the same liveness guarantee as Windows. Unref so it never blocks exit.
-  watchdogTimer = setInterval(() => {
-    ensureServerHealthy().catch((err) =>
-      logFn("debug", "watchdog tick failed", { error: errStr(err) })
-    )
-  }, WATCHDOG_INTERVAL_MS)
-  if (watchdogTimer.unref) watchdogTimer.unref()
+  // Only enable the watchdog on Windows where the CLI server runs.
+  if (isWindows) {
+    watchdogTimer = setInterval(() => {
+      ensureServerHealthy().catch((err) =>
+        logFn("debug", "watchdog tick failed", { error: errStr(err) })
+      )
+    }, WATCHDOG_INTERVAL_MS)
+    if (watchdogTimer.unref) watchdogTimer.unref()
+  }
+
+  // ── Funnel health monitor ─────────────────────────────────────────────
+  // Tailscale Funnel can silently drop after reboot, suspend/resume, or
+  // network changes. Every 5 min we verify it's still routing to port 4096
+  // and auto-repair by running `tailscale funnel 4096` if not.
+  let funnelTimer = null
+  if (isWindows) {
+    funnelTimer = setInterval(() => {
+      checkFunnelHealth(logFn, osNotify).catch((err) =>
+        logFn("debug", "funnel health tick failed", { error: errStr(err) })
+      )
+    }, FUNNEL_CHECK_INTERVAL_MS)
+    if (funnelTimer.unref) funnelTimer.unref()
+  }
 
   // ΓöÇΓöÇ Deferred init: run heavy work AFTER returning hooks ΓöÇΓöÇ
   // This prevents the plugin from blocking OpenCode's GUI startup.
@@ -883,25 +876,44 @@ const MobileSyncPlugin = async ({ client, $ }) => {
       const sidecar = await ensureSidecarRunning(logFn)
       launcherPid = sidecar.pid
 
-      // Start watcher only if desktop is installed (watcher re-patches desktop app.asar).
-      // CLI server doesn't need a watcher. Guard scriptsDir null (e.g. plugin loaded via custom abs path).
-      const desktopInstalled = !!scriptsDir && existsSync(join(scriptsDir, "start-opencode-desktop.ps1"))
+      // Start watcher only if the desktop patcher script is present.
+      // The watcher re-patches app.asar after OpenCode updates.
+      // Without the script the plugin still works — the CLI server is unaffected.
+      const desktopPatcher = scriptsDir
+        ? join(scriptsDir, "start-opencode-desktop.ps1")
+        : null
+      const desktopInstalled = desktopPatcher ? existsSync(desktopPatcher) : false
       const portIsUp = sidecar.launched || (await isPortListening(port))
       if (portIsUp && desktopInstalled) {
         watcherProc = startWatcher(logFn)
       }
 
-      await checkForUpdates(logFn, notify)
+      // Verify and (if needed) repair Tailscale Funnel before reporting ready.
+      // This is the last step before the "Ready" toast so the toast reflects
+      // actual mobile-access availability, not just plugin load.
+      await checkFunnelHealth(logFn, osNotify)
+
+      await checkForUpdates(logFn, osNotify)
       lastUpdateCheckAt = Date.now()
 
-      logFn("info", `initialized (port ${port})`)
+      const portStatus = portIsUp ? "up" : "down"
+      const funnelStatusText =
+        _funnelStatus === true ? "Funnel ON" :
+        _funnelStatus === false ? "Funnel OFF" :
+        "Funnel unknown"
+      logFn("info", `initialized (port ${port}: ${portStatus}, ${funnelStatusText})`)
 
-      // Delayed startup toast ΓÇö shows after GUI has loaded (5s).
+      // Delayed startup toast — shows after GUI has loaded (5s).
       // Tracked so dispose can cancel it if plugin unloads before it fires.
-      // .catch guards against unhandled rejection in the fire-and-forget timer.
+      // Body now reflects actual port + funnel state so the user knows
+      // whether mobile access is working without reading logs.
       startupToastTimer = setTimeout(() => {
         startupToastTimer = null
-        notify("mobile-sync Ready", `v${MOBILE_SYNC_VERSION} active on port ${port}`, "success")
+        const variant = (_funnelStatus === true && portIsUp) ? "success" : "warning"
+        const body = _funnelStatus === true && portIsUp
+          ? `v${MOBILE_SYNC_VERSION} • port ${port} • Funnel active`
+          : `v${MOBILE_SYNC_VERSION} • port ${port}: ${portStatus} • ${funnelStatusText}`
+        osNotify("mobile-sync Ready", body, variant)
           .catch((err) => logFn("debug", "startup toast failed", { error: errStr(err) }))
       }, 5_000)
       if (startupToastTimer?.unref) startupToastTimer.unref()
@@ -952,7 +964,7 @@ const MobileSyncPlugin = async ({ client, $ }) => {
         if (!event || typeof event.type !== "string") return
 
         if (event.type === "session.idle") {
-          if (relaunching) return
+          if (!isWindows || relaunching) return
           // If we just attempted a relaunch, give the new process a few
           // seconds to bind the port before probing again. The watchdog
           // (running every 30s) handles the long-term recovery; this hook
@@ -986,7 +998,7 @@ const MobileSyncPlugin = async ({ client, $ }) => {
       }
     },
 
-// Cleanup on unload.
+    // Cleanup on unload.
     // The CLI server (opencode.exe serve) is intentionally LEFT RUNNING when
     // the plugin unloads: mobile clients connect to it independently of the
     // OpenCode desktop app, and killing it would disconnect them. Set
@@ -1000,6 +1012,10 @@ const MobileSyncPlugin = async ({ client, $ }) => {
         clearInterval(watchdogTimer)
         watchdogTimer = null
       }
+      if (funnelTimer) {
+        clearInterval(funnelTimer)
+        funnelTimer = null
+      }
       if (startupToastTimer) {
         clearTimeout(startupToastTimer)
         startupToastTimer = null
@@ -1008,16 +1024,18 @@ const MobileSyncPlugin = async ({ client, $ }) => {
         try { watcherProc.kill() } catch {}
         watcherProc = null
       }
-      // Best-effort: kill the wrapper that launched the sidecar. This is
-      // usually a no-op (the wrapper has already exited), but if MOBILE_SYNC_KILL_SERVER_ON_DISPOSE
-      // is set we also walk the process tree to terminate the opencode.exe grandchild.
+      // Best-effort: terminate the opencode serve process and its children.
+      // The CLI server is intentionally LEFT RUNNING when the plugin unloads:
+      // mobile clients connect to it independently of the OpenCode desktop app,
+      // and killing it would disconnect them. Set
+      // MOBILE_SYNC_KILL_SERVER_ON_DISPOSE=1 to override.
       if (launcherPid) {
         const tree = process.env.MOBILE_SYNC_KILL_SERVER_ON_DISPOSE === "1"
         if (isWindows && tree) {
-          // /T = terminate child tree, /F = force. Await to ensure cleanup completes.
-          await new Promise((resolve) => {
-            execFile("taskkill", ["/T", "/F", "/PID", String(launcherPid)], { windowsHide: true }, () => resolve())
-          })
+          // /T = terminate child tree, /F = force. Ignore exit code — the
+          // process may have already exited and taskkill returns non-zero
+          // in that case, which is fine.
+          execFile("taskkill", ["/T", "/F", "/PID", String(launcherPid)], { windowsHide: true }, () => {})
         }
         launcherPid = null
       }
