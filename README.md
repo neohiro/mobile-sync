@@ -230,7 +230,7 @@ Each device runs the plugin independently with its own session database. The mob
 
 **Same password on all devices** is recommended for easy switching. The password file is at `~\.opencode-server-password` (Windows) / `~/.opencode-server-password` (POSIX) and is generated on first run.
 
-**URLs are device-specific** — the plugin dynamically detects the full Tailscale DNS name (e.g., `laptop-xyz.taild879f3.ts.net`) from `tailscale status --json`. No hardcoded hostnames.
+**URLs are device-specific** — the plugin dynamically detects the full Tailscale DNS name (e.g., `<device>.<your-tailnet>.ts.net`) from `tailscale status --json`. No hardcoded hostnames.
 
 ## Configuration
 
