@@ -32,7 +32,7 @@ if (Test-Path -LiteralPath $funnelConfigFile) {
     # Validate: must be https://, must have a non-empty hostname that starts
     # and ends with an alphanumeric. The `*` origin wildcard is also rejected
     # here because it would defeat the whole point of the allowlist.
-    if ($funnelUrl -and $funnelUrl -ne '*' -and $funnelUrl -match '^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(/.*)?$') {
+    if ($funnelUrl -and $funnelUrl -ne '*' -and $funnelUrl -match '^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?$') {
         $corsOrigins += $funnelUrl
     } elseif ($funnelUrl) {
         Write-Host "WARN: $funnelConfigFile contains invalid URL: '$funnelUrl' (expected https://hostname). Ignoring." -ForegroundColor Yellow
