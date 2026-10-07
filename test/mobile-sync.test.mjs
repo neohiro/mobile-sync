@@ -6,6 +6,7 @@
 
 import { strict as assert } from "node:assert"
 import { randomBytes } from "node:crypto"
+import { spawnSync } from "node:child_process"
 import { writeFileSync, existsSync, unlinkSync, chmodSync, mkdirSync, readFileSync, renameSync, symlinkSync, lstatSync, rmSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -518,6 +519,92 @@ function setFunnelUrl(val) {
 // The third was missed when the first two were fixed and kept the old regex
 // including an optional path group, so it accepted "https://host/anything" as an
 // origin while the others rejected it. Check all of them here, not just one.
+// The three PowerShell/JS copies are kept in step by
+// scripts/sync-cors-pattern.mjs, which owns the canonical pattern.
+//
+// That script had a bug that silently corrupted the two PowerShell files: it
+// passed the replacement to String.replace() as a string, and the replacement
+// ends with "?$'". In String.replace, "$'" is a special pattern meaning
+// "everything after the match", so the rest of the file was spliced in -- the
+// regex literal ended up unterminated and the script stopped parsing. The JS
+// replacements end with "$/" and were unaffected, which is why it only showed
+// up on .ps1 files. Pin the behaviour so the fix cannot silently regress.
+//
+// The staged break below uses a replacer FUNCTION for the same reason: writing
+// it as a replacement string reproduced the identical corruption inside the test
+// itself, which is how the original bug was found.
+console.log("\nCORS pattern single-sourcing")
+test("sync-cors-pattern repairs a drifted pattern without corrupting the file", () => {
+  const selfPath = fileURLToPath(import.meta.url)
+  const root = join(dirname(selfPath), "..")
+  const syncScript = join(root, "scripts", "sync-cors-pattern.mjs")
+  if (!existsSync(syncScript)) {
+    return // script absent; nothing to guard
+  }
+
+  const target = join(root, "scripts", "start-opencode-desktop.ps1")
+  const pristine = readFileSync(target)
+
+  // The sync script repairs EVERY drifted location, not just the one broken
+  // below. Snapshot all four so this test cannot silently "fix" drift that a
+  // later test is relying on detecting -- that made the drift test below pass
+  // even with a PowerShell file mutated.
+  const SYNCED = [
+    "mobile-sync.js",
+    "scripts/start-opencode-desktop.ps1",
+    "scripts/start-opencode-server.ps1",
+    "test/mobile-sync.test.mjs",
+  ].map((rel) => [join(root, rel), readFileSync(join(root, rel))])
+  const restoreAll = () => {
+    for (const [p, bytes] of SYNCED) writeFileSync(p, bytes)
+  }
+
+  const broken = pristine
+    .toString("utf8")
+    .replace(
+      /\$funnelUrl -match '\^https[^']*'/,
+      () => "$funnelUrl -match '^https://BROKEN$'",
+    )
+  assert.notEqual(broken, pristine.toString("utf8"), "could not stage the break")
+
+  try {
+    writeFileSync(target, broken, "utf8")
+    const res = spawnSync(process.execPath, [syncScript], {
+      cwd: root, encoding: "utf8",
+    })
+    assert.equal(res.status, 0, `sync failed: ${res.stderr}`)
+
+    // Byte equality is the real assertion: the bug appended ~5 KB of duplicated
+    // file content, so any splice fails here. Do NOT additionally grep for
+    // marker text -- the legitimate WARN message already contains a substring
+    // that looked like the splice signature and produced a false positive.
+    assert.deepEqual(
+      readFileSync(target),
+      pristine,
+      "sync did not restore the file byte-for-byte (check for a String.replace '$' special-pattern bug)",
+    )
+
+    // The regex literal must still be terminated and the script must still parse.
+    const after = readFileSync(target, "utf8")
+    assert.ok(
+      after.includes(
+        "-match '^https://[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?$'",
+      ),
+      "the canonical pattern is not present after sync",
+    )
+    // No duplicate/spliced content: the repaired file must have the same number
+    // of lines as the pristine one. (Counting "-match '" occurrences is not
+    // usable -- the legitimate -ne '*' wildcard guard matches that shape too.)
+    assert.equal(
+      after.split(/\r?\n/).length,
+      pristine.toString("utf8").split(/\r?\n/).length,
+      "sync changed the line count, so content was spliced in or lost",
+    )
+  } finally {
+    restoreAll()
+  }
+})
+
 console.log("\nreadCorsAllowlist")
 // The three validators must (a) agree with each other and (b) be the pattern we
 // actually intend. Comparing them to each other alone is not enough: if all

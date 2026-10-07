@@ -37,3 +37,11 @@ jobs:
       # on a user's machine.
       - name: Syntax check
         run: bun --check mobile-sync.js
+
+      # The CORS origin pattern is duplicated across mobile-sync.js and two
+      # PowerShell launchers. All three have drifted apart before, once shipping
+      # a check that accepted "https://host/anything" as an origin while the
+      # others rejected it. scripts/sync-cors-pattern.mjs owns the canonical
+      # pattern; --check fails if any copy has drifted from it.
+      - name: CORS pattern in sync
+        run: bun scripts/sync-cors-pattern.mjs --check
