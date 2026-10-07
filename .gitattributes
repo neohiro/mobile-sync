@@ -1,0 +1,59 @@
+# Line-ending discipline.
+#
+# Without this, git falls back to core.autocrlf, which differs per machine. A
+# contributor on Windows with autocrlf=true would get CRLF in the working tree
+# and a whitespace-only diff on every file touched; one with autocrlf=false would
+# get the opposite. Neither is a real change, and both are easy to commit by
+# accident.
+#
+# `text=auto` lets git detect binary files itself; `eol=lf` normalises text to LF
+# in the repository and checks it out as LF on every platform, including Windows.
+# This also matches check_eol.py / the org-wide .gitattributes, so the repo and
+# the workspace tooling agree.
+#
+# The pattern and its attributes must be on ONE line -- written as a bare `*`
+# followed by `text=auto eol=lf` on the next, git parses them as two (invalid)
+# patterns and applies neither, which `git check-attr` reports as "unspecified".
+* text=auto eol=lf
+
+# Genuinely binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.bz2 binary
+*.xz binary
+*.7z binary
+*.rar binary
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.eot binary
+*.mp3 binary
+*.mp4 binary
+*.mov binary
+*.avi binary
+*.webm binary
+*.age binary
+
+# Private keys must never be line-ending converted: some tools reject CRLF in a
+# PEM, and a mangled key is unrecoverable.
+*.pem text eol=lf
+*.key text eol=lf
+
+# Windows-only scripts that genuinely need CRLF. None of the current scripts
+# require it (PowerShell reads LF fine), but keep the escape hatch documented so
+# a future .cmd/.bat is not fought with.
+*.bat text eol=crlf
+*.cmd text eol=crlf
