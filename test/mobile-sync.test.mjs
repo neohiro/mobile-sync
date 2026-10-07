@@ -7,7 +7,8 @@
 import { strict as assert } from "node:assert"
 import { randomBytes } from "node:crypto"
 import { writeFileSync, existsSync, unlinkSync, chmodSync, mkdirSync, readFileSync, renameSync, symlinkSync, lstatSync, rmSync } from "node:fs"
-import { join } from "node:path"
+import { join, dirname } from "node:path"
+import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
 
 let passed = 0
@@ -361,6 +362,64 @@ test("pre-release tag is ignored (treated as 0)", () => {
   assert.equal(isNewer("1.0.0-rc1", "1.0.0"), false)
 })
 
+// MOBILE_SYNC_VERSION used to be a hardcoded literal that drifted from
+// package.json (1.0.2 vs 1.1.2) and from the latest release, so checkForUpdates
+// believed an update was always available and reinstalled itself every hour.
+// Assert against the real files so that regression cannot return silently.
+console.log("\nplugin version resolution")
+test("MOBILE_SYNC_VERSION is derived from package.json, not hardcoded", () => {
+  const selfPath = fileURLToPath(import.meta.url)
+  const root = join(dirname(selfPath), "..")
+  const srcText = readFileSync(join(root, "mobile-sync.js"), "utf8")
+  const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"))
+
+  assert.ok(
+    !/const MOBILE_SYNC_VERSION\s*=\s*"/.test(srcText),
+    "MOBILE_SYNC_VERSION must not be a string literal; it must come from package.json",
+  )
+  assert.ok(
+    /const MOBILE_SYNC_VERSION\s*=\s*readPluginVersion\(\)/.test(srcText),
+    "MOBILE_SYNC_VERSION must be assigned from readPluginVersion()",
+  )
+  assert.match(pkg.version, /^\d+\.\d+\.\d+$/, "package.json version must be bare semver")
+
+  // Evaluate the real derivation by loading the function out of the real
+  // source, so this test cannot drift from what ships.
+  const manifest = readFileSync(join(root, "package.json"), "utf8")
+  const fnSrc = /function readPluginVersion\(\)[\s\S]*?\n}/.exec(srcText)
+  assert.ok(fnSrc, "readPluginVersion() not found in mobile-sync.js")
+  // Swap import.meta.url for a fixed path so the body can run under new Function.
+  const runnable = fnSrc[0].replace(
+    /new URL\("\.\/package\.json", import\.meta\.url\)/,
+    '"package.json"',
+  )
+  const derived = new Function("readFileSync", `${runnable}; return readPluginVersion()`)(
+    () => manifest,
+  )
+  assert.equal(derived, pkg.version, "derived version must equal package.json version")
+
+  // The fallback exists so a missing/mangled manifest cannot break plugin load.
+  const boom = () => { throw new Error("missing") }
+  assert.equal(new Function("readFileSync", `${runnable}; return readPluginVersion()`)(boom), "0.0.0")
+  assert.equal(
+    new Function("readFileSync", `${runnable}; return readPluginVersion()`)(() => "not json"),
+    "0.0.0",
+  )
+  assert.equal(
+    new Function("readFileSync", `${runnable}; return readPluginVersion()`)(() => "{}"),
+    "0.0.0",
+  )
+  assert.equal(
+    new Function("readFileSync", `${runnable}; return readPluginVersion()`)(() => '{"version":"1.2"}'),
+    "0.0.0",
+  )
+  assert.equal(
+    new Function("readFileSync", `${runnable}; return readPluginVersion()`)(() => '{"version":"9.9.9"}'),
+    "9.9.9",
+  )
+  void selfPath
+})
+
 console.log("\ncopyDir (symlink safety)")
 // Reimplement copyDir to test the logic in isolation
 async function copyDir(src, dest) {
@@ -424,13 +483,15 @@ const FUNNEL_URL_FILE = join(testDir, "funnel-url.txt")
 
 // Reimplement just enough of readCorsAllowlist to test it in isolation.
 // Mirrors mobile-sync.js exactly so we catch regressions in the source logic.
+// The two have drifted before (this copy kept a stale regex while the source was
+// tightened), so assert they still match rather than trusting the comment.
 function readCorsAllowlist(override) {
   const file = override || FUNNEL_URL_FILE
   const origins = ["oc://renderer"]
   try {
     if (existsSync(file)) {
       const url = readFileSync(file, "utf8").trim()
-      if (/^https:\/\/[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/i.test(url)) {
+      if (/^https:\/\/[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?$/i.test(url)) {
         origins.push(url)
       }
     }
@@ -446,7 +507,72 @@ function setFunnelUrl(val) {
   }
 }
 
+// The duplicate above is only trustworthy while it matches the source. Compare
+// the two regex literals directly so a change to either is caught here.
+//
+// There are THREE copies of this validator in the project, and all three have
+// drifted apart at some point:
+//   - mobile-sync.js                      readCorsAllowlist()
+//   - scripts/start-opencode-desktop.ps1  desktop sidecar CORS allowlist
+//   - scripts/start-opencode-server.ps1   CLI server CORS allowlist
+// The third was missed when the first two were fixed and kept the old regex
+// including an optional path group, so it accepted "https://host/anything" as an
+// origin while the others rejected it. Check all of them here, not just one.
 console.log("\nreadCorsAllowlist")
+// The three validators must (a) agree with each other and (b) be the pattern we
+// actually intend. Comparing them to each other alone is not enough: if all
+// three were changed together to something weaker, mutual agreement would still
+// hold while the check quietly stopped rejecting malformed origins. So pin the
+// expected pattern as well -- that is what makes a deliberate change a visible,
+// deliberate edit to this test rather than a silent regression.
+const EXPECTED = "^https://[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?$"
+
+test("every CORS validator in the repo uses the same regex", () => {
+  const selfPath = fileURLToPath(import.meta.url)
+  const root = join(dirname(selfPath), "..")
+  const copyText = readFileSync(selfPath, "utf8")
+  const srcText = readFileSync(join(root, "mobile-sync.js"), "utf8")
+
+  const jsRx = /if \(\/\^?(https.*?\$)\/i\.test\(url\)\)/.exec(copyText)
+  assert.ok(jsRx, "could not locate the origin regex in this file")
+  // The capture starts after "^", so re-add it for a like-for-like comparison.
+  const jsPattern = `^${jsRx[1]}`
+  const norm = (s) => s.replaceAll("\\/", "/")
+
+  assert.equal(
+    norm(jsPattern),
+    EXPECTED,
+    "the origin regex itself changed; update EXPECTED here deliberately if that is intended",
+  )
+
+  // Compare against the real source too, not only against this file's copy.
+  // Without this, weakening mobile-sync.js alone would go unnoticed, because the
+  // two PowerShell scripts would still agree with each other.
+  const srcRx = /if \(\/\^?(https.*?\$)\/i\.test\(url\)\)/.exec(srcText)
+  assert.ok(srcRx, "could not locate the origin regex in mobile-sync.js")
+  assert.equal(
+    norm(`^${srcRx[1]}`),
+    EXPECTED,
+    "mobile-sync.js has drifted from the pinned origin pattern",
+  )
+
+  const psFiles = [
+    "scripts/start-opencode-desktop.ps1",
+    "scripts/start-opencode-server.ps1",
+  ]
+  for (const rel of psFiles) {
+    const text = readFileSync(join(root, rel), "utf8")
+    const m = /-match '(\^https[^']*)'/.exec(text)
+    assert.ok(m, `could not locate the origin regex in ${rel}`)
+    // "/" is escaped inside a JS regex literal but not inside a PowerShell
+    // single-quoted string, so normalise before comparing.
+    assert.equal(
+      norm(m[1]),
+      EXPECTED,
+      `${rel} has drifted from the pinned origin pattern`,
+    )
+  }
+})
 test("file missing -> ['oc://renderer']", () => {
   setFunnelUrl(null)
   const got = JSON.parse(readCorsAllowlist())
@@ -480,10 +606,10 @@ test("http rejected -> ['oc://renderer']", () => {
   const got = JSON.parse(readCorsAllowlist())
   assert.deepEqual(got, ["oc://renderer"])
 })
-test("wildcard '*' not in file -> accepted (this is the upstream bug; documented here)", () => {
-  // This test documents the known gap: if the funnel file contains "*", the
-  // regex rejects it (no https:// prefix), so it's treated as no URL.
-  // The caller (start-opencode-desktop.ps1) now adds its own wildcard check.
+test("wildcard '*' rejected", () => {
+  // A wildcard origin would defeat the allowlist, so it must never be admitted.
+  // The regex rejects it here (no https:// prefix); start-opencode-desktop.ps1
+  // additionally checks for '*' explicitly.
   setFunnelUrl("*")
   const got = JSON.parse(readCorsAllowlist())
   assert.deepEqual(got, ["oc://renderer"])
@@ -524,6 +650,33 @@ test("read error on file -> ['oc://renderer'] (no crash)", () => {
     try { chmodSync(FUNNEL_URL_FILE, 0o644) } catch {}
   }
 })
+// Origin shape: ports are part of a CORS origin and must be accepted, while
+// paths, credentials and malformed labels must be rejected. These were the gaps
+// that let an invalid origin through (or a valid one be dropped).
+const ORIGIN_CASES = [
+  ["https://machine.tailnet.ts.net", ["oc://renderer", "https://machine.tailnet.ts.net"], "typical funnel name"],
+  ["https://a.ts.net", ["oc://renderer", "https://a.ts.net"], "single-char host"],
+  ["https://m-laptop.tail1234.ts.net", ["oc://renderer", "https://m-laptop.tail1234.ts.net"], "digits in label"],
+  ["https://machine.tailnet.ts.net:443", ["oc://renderer", "https://machine.tailnet.ts.net:443"], "explicit default port"],
+  ["https://machine.tailnet.ts.net:8443", ["oc://renderer", "https://machine.tailnet.ts.net:8443"], "non-default port"],
+  ["HTTPS://MACHINE.TAILNET.TS.NET", ["oc://renderer", "HTTPS://MACHINE.TAILNET.TS.NET"], "uppercase host is valid"],
+  ["http://machine.tailnet.ts.net", ["oc://renderer"], "http rejected"],
+  ["https://machine.tailnet.ts.net/path", ["oc://renderer"], "path rejected (not part of an origin)"],
+  ["https://machine.tailnet.ts.net/", ["oc://renderer"], "trailing slash rejected"],
+  ["https://-machine.ts.net", ["oc://renderer"], "leading hyphen rejected"],
+  ["https://machine-.ts.net", ["oc://renderer"], "trailing hyphen rejected"],
+  ["https://machine..ts.net", ["oc://renderer"], "consecutive dots rejected"],
+  ["https://user:pass@host.ts.net", ["oc://renderer"], "credentials rejected"],
+  ["https://h.ts.net:abc", ["oc://renderer"], "non-numeric port rejected"],
+  ["https://h.ts.net:80/x", ["oc://renderer"], "port then path rejected"],
+]
+for (const [url, expected, why] of ORIGIN_CASES) {
+  test(`origin: ${why} (${url})`, () => {
+    setFunnelUrl(url)
+    assert.deepEqual(JSON.parse(readCorsAllowlist()), expected)
+  })
+}
+
 // clean up funnel URL file after tests
 setFunnelUrl(null)
 

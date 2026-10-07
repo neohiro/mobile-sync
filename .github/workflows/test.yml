@@ -1,0 +1,39 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref: these tests are hermetic and fast, so
+# the newest commit is the only one worth reporting.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Bun because the plugin and its test suite are written against it
+      # (package.json "test": "bun test").
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The suite covers the CORS allowlist, version resolution, semver
+      # comparison, ETag cache handling and copyDir symlink safety. It stubs all
+      # I/O and makes no network calls, so it is safe to run on every push.
+      - name: Run test suite
+        run: bun test
+
+      # A syntax error in the plugin would otherwise only surface at load time
+      # on a user's machine.
+      - name: Syntax check
+        run: bun --check mobile-sync.js

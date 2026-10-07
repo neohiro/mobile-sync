@@ -29,10 +29,15 @@ $funnelConfigFile = "$env:USERPROFILE\.opencode-funnel-url"
 $corsOrigins = @('oc://renderer')
 if (Test-Path -LiteralPath $funnelConfigFile) {
     $funnelUrl = (Get-Content -LiteralPath $funnelConfigFile -Raw).Trim()
-    # Validate: must be https://, must have a non-empty hostname that starts
-    # and ends with an alphanumeric. The `*` origin wildcard is also rejected
-    # here because it would defeat the whole point of the allowlist.
-    if ($funnelUrl -and $funnelUrl -ne '*' -and $funnelUrl -match '^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?$') {
+    # Validate: https:// plus a hostname of dot/hyphen separated labels, each
+    # starting and ending alphanumeric, plus an optional port. A CORS origin
+    # is scheme://host[:port]; rejecting a port would silently drop a
+    # legitimate funnel URL and leave the allowlist as oc://renderer only,
+    # breaking mobile sync. A path is not part of an origin and is rejected.
+    # The `*` origin wildcard is also rejected because it would defeat the
+    # whole point of the allowlist. Must stay in step with readCorsAllowlist
+    # in mobile-sync.js.
+    if ($funnelUrl -and $funnelUrl -ne '*' -and $funnelUrl -match '^https://[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?$') {
         $corsOrigins += $funnelUrl
     } elseif ($funnelUrl) {
         Write-Host "WARN: $funnelConfigFile contains invalid URL: '$funnelUrl' (expected https://hostname). Ignoring." -ForegroundColor Yellow

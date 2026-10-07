@@ -31,7 +31,23 @@ import { join, dirname } from "node:path"
 import { homedir, platform, tmpdir } from "node:os"
 import { createConnection } from "node:net"
 
-const MOBILE_SYNC_VERSION = "1.0.2"
+// Single source of truth: package.json. This used to be a hardcoded
+// "1.0.2" that drifted from the manifest (1.1.2) and from the latest
+// release, so the auto-updater saw an available update on every hourly
+// check and reinstalled itself in a loop. Falling back to 0.0.0 keeps the
+// updater working (it pulls the newest release) if the manifest is
+// unreadable, rather than throwing at import and breaking plugin load.
+function readPluginVersion() {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8"))
+    const v = pkg && pkg.version
+    return typeof v === "string" && /^\d+\.\d+\.\d+$/.test(v) ? v : "0.0.0"
+  } catch {
+    return "0.0.0"
+  }
+}
+
+const MOBILE_SYNC_VERSION = readPluginVersion()
 const GITHUB_REPO = "neohiro/mobile-sync"
 const UPDATE_CHECK_INTERVAL_MS = 3_600_000 // hourly
 const DEFAULT_PORT = 4096
@@ -95,9 +111,16 @@ function readCorsAllowlist() {
   try {
     if (existsSync(FUNNEL_URL_FILE)) {
       const url = readFileSync(FUNNEL_URL_FILE, "utf8").trim()
-      // Validate: only accept https:// prefixed URLs with a non-empty hostname to prevent
-      // injection of arbitrary origin strings into the sidecar's CORS policy.
-      if (/^https:\/\/[a-z0-9]([a-z0-9.-]*[a-z0-9])?(\/.*)?$/i.test(url)) {
+      // Validate: https:// plus a hostname of dot/hyphen separated labels, each
+      // starting and ending alphanumeric, plus an optional port. A CORS origin
+      // is scheme://host[:port]; rejecting a port would silently drop a
+      // legitimate funnel URL and leave the allowlist as oc://renderer only,
+      // breaking mobile sync. A path is not part of an origin and is rejected --
+      // this previously accepted one, which start-opencode-desktop.ps1 did not,
+      // so a hand-edited funnel file was admitted here and rejected there.
+      // Case-insensitive: hostnames are by definition. Must stay in step with
+      // the matching check in start-opencode-desktop.ps1.
+      if (/^https:\/\/[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?$/i.test(url)) {
         origins.push(url)
       }
     }
