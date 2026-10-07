@@ -120,9 +120,12 @@ if (-not $exe) { throw "opencode.exe not found. Install via: winget install SST.
 # config file written by setup-opencode-shared.ps1 keeps a single source of
 # truth. URL regex must match the same check the plugin uses
 # (mobile-sync.js readCorsAllowlist) so we reject the same malformed
-# inputs — defense in depth.
+# inputs — defense in depth. Keep all three copies of this check
+# (here, start-opencode-desktop.ps1, and readCorsAllowlist in mobile-sync.js)
+# identical: this one had drifted and still allowed a path, admitting
+# https://host/anything as an origin.
 $corsOrigins = @('oc://renderer')
-if ($funnelUrl -and $funnelUrl -ne '*' -and $funnelUrl -match '^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(/.*)?$') {
+if ($funnelUrl -and $funnelUrl -ne '*' -and $funnelUrl -match '^https://[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]{1,5})?$') {
     $corsOrigins += $funnelUrl
 } elseif ($funnelUrl) {
     Write-Host "WARN: $funnelConfigFile contains invalid URL: '$funnelUrl' (expected https://hostname). Ignoring." -ForegroundColor Yellow
